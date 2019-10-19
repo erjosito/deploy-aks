@@ -1,0 +1,63 @@
+apiVersion: apps/v1beta1
+kind: Deployment
+metadata:
+  name: kuard-vnode-ingress
+spec:
+  replicas: 2
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
+  minReadySeconds: 5 
+  template:
+    metadata:
+      labels:
+        app: kuard-vnode-ingress
+    spec:
+      containers:
+      - name: kuard-vnode-ingress
+        image: gcr.io/kuar-demo/kuard-amd64:blue
+        ports:
+        - containerPort: 8080
+      tolerations:
+      - key: virtual-kubelet.io/provider
+        operator: Exists
+      - effect: NoSchedule
+        key: azure.com/aci
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 1
+            preference:
+              matchExpressions:
+              - key: type
+                operator: NotIn
+                values:
+                - virtual-kubelet
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kuard-vnode-ingress
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8080
+  selector:
+    app: kuard-vnode-ingress
+---
+apiVersion: extensions/v1beta1
+kind: Ingress
+metadata:
+  name: kuard-ingress
+  annotations:
+    kubernetes.io/ingress.class: azure/application-gateway
+spec:
+  rules:
+  - host: <host_fqdn>
+    http:
+      paths:
+      - backend:
+          serviceName: kuard-vnode-ingress
+          servicePort: 8080
+        path: /kuard/
