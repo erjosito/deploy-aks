@@ -20,3 +20,13 @@ Note that if you do not specify a resource group with the flag -g, the default r
 
 You will probably want to remove the cluster after deploying it, in order to save costs. In most cases it would be enough removing the resource group where all resources are contained (`az remove group -n akstest -y --nowait`), but in some cases some extra operations might have to be performed (like when testing virtual node). For that case the script `clenaupaks.sh` should remove everything from the test, including the configurations in kube.config for the clusters.
 
+## What can be tested?
+
+Here some examples of which scenarios can be built with this script:
+
+* Compare Azure CNI with kubenet: you can use the script to create Azure CNI clusters or kubenet clusters (both in your own vnet)
+* Global vnet peering to AKS: use the flag `--vnet-peering`
+* Increasing ephemeral ports for egress connections to the Internet: the Azure CNI cluster is created with the standard LB and configures two additional public IP address for outbound rules in the standard ALB.
+* Test windows pools: use the flag `--windows`
+* Test kubernetes network policies: use the flag `--network-policy=azure|calico|none`
+* Application Gateway as Ingress Controller: use the flag `--appgw`
