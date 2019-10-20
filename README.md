@@ -10,7 +10,7 @@ It is recommended to run the script in the current shell (using source ./deploya
 
 ```
 $ ./deployaks.sh -h
-Please run this script as "source ./deployaks.sh [--mode=kubenet|azure] [--network-policy=azure|calico|none] [--resource-group=yourrg] [--vnet-peering] [--kubernetes-version=x.x.x] [--windows] [--appgw]"
+Please run this script as "source ./deployaks.sh [--mode=kubenet|azure] [--network-policy=azure|calico|none] [--resource-group=yourrg] [--vnet-peering] [--kubernetes-version=x.x.x] [--windows] [--appgw] [--vm]"
   -> Example: "source ./deployaks.sh -m=azure -p=azure -g=akstest"
 ```
 
@@ -25,6 +25,7 @@ You will probably want to remove the cluster after deploying it, in order to sav
 Here some examples of which scenarios can be built with this script:
 
 * Compare Azure CNI with kubenet: you can use the script to create Azure CNI clusters or kubenet clusters (both in your own vnet)
+* Access from inside of the vnet (similar to accessing the cluster from onprem): use the flag `--vm`
 * Global vnet peering to AKS: use the flag `--vnet-peering`
 * Increasing ephemeral ports for egress connections to the Internet: the Azure CNI cluster is created with the standard LB and configures two additional public IP address for outbound rules in the standard ALB.
 * Test windows pools: use the flag `--windows`

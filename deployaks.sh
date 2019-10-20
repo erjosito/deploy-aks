@@ -44,8 +44,7 @@ monitor_ws=logtest1138
 acr_rg=myAcr
 acr_name=erjositoAcr
 # DNS
-dnszone=cloudtrooper.net
-dnsrg=dns
+dnszone=cloudtrooper.dummy
 # App Gateway
 appgw_subnetname=appgw
 appgw_subnetprefix=10.13.10.0/24
@@ -125,7 +124,7 @@ fi
 # If the --help flag was issued, show help message and stop right here
 if [ "$help" == "yes" ]
 then
-     echo "Please run this script as \"source $0 [--mode=kubenet|azure] [--network-policy=azure|calico|none] [--resource-group=yourrg] [--vnet-peering] [--kubernetes-version=x.x.x] [--windows] [--appgw]\""
+     echo "Please run this script as \"source $0 [--mode=kubenet|azure] [--network-policy=azure|calico|none] [--resource-group=yourrg] [--vnet-peering] [--kubernetes-version=x.x.x] [--windows] [--appgw] [--vm]\""
      echo " -> Example: \"source $0 -m=azure -p=azure -g=akstest2\""
      exit
 fi
@@ -208,7 +207,6 @@ then
           --no-wait
 fi
 
-
 # Create Azure CNI cluster
 if [ "$create_azure" == "yes" ]
 then
@@ -218,8 +216,6 @@ then
      az network public-ip create -g $rg -n $pip2_name --sku standard >/dev/null
      pip1_id=$(az network public-ip show -g $rg -n $pip1_name --query id -o tsv)  # This command does not seem to work (Az CLI bug?)
      pip2_id=$(az network public-ip show -g $rg -n $pip2_name --query id -o tsv)
-     # pip1_id=$(az network public-ip prefix list --query [].id -o tsv | grep $pip1_name)
-     # pip2_id=$(az network public-ip prefix list --query [].id -o tsv | grep $pip2_name)
      # Subnet
      echo 'Creating subnet for Azure CNI cluster...'
      az network vnet subnet create -g $rg -n $subnet_azure --vnet-name $vnet --address-prefix $subnetprefix_azure >/dev/null
@@ -251,18 +247,35 @@ fi
 # Create app gateway
 if [ "$create_appgw" == "yes" ] && [ "$create_azure" == "yes" ]
 then
+     # Decide if using DNS zones or the PIP FQDN (NOT FINISHED)
+     zonename=$(az network dns zone list -o tsv --query "[?name=='$dnszone'].name")
+     if [ "$zonename" == "$dnszone" ]
+     then
+          dnsrg=$(az network dns zone list -o tsv --query "[?name=='$dnszone'].resourceGroup")
+          echo "Azure DNS zone $dnszone found in resource group $dnsrg"
+          use_azure_dns=yes
+     else
+          echo "Azure DNS zone not found in subscription, using public IP FQDN"
+          use_azure_dns=no
+     fi
+
      # Create App Gw subnet
      echo 'Creating subnet for application gateway...'
      az network vnet subnet create -g $rg -n $appgw_subnetname --vnet-name $vnet --address-prefix $appgw_subnetprefix >/dev/null
      # Create public IP
      echo 'Creating public IP address for application gateway...'
-     az network public-ip create -g $rg -n $appgw_pipname --sku Standard >/dev/null
+     az network public-ip create -g $rg -n $appgw_pipname --sku Standard --dns-name $appgw_dnsname >/dev/null
      appgw_ip=$(az network public-ip show -g $rg -n $appgw_pipname --query ipAddress -o tsv)
      # Create DNS name
-     appgw_fqdn="$appgw_dnsname"."$dnszone"
-     echo "Adding DNS name $appgw_fqdn for public IP $appgw_ip..."
-     az network dns record-set a create -g $dnsrg -z $dnszone -n $appgw_dnsname >/dev/null
-     az network dns record-set a add-record -g $dnsrg -z $dnszone -n $appgw_dnsname -a $appgw_ip >/dev/null
+     if [ "$use_azure_dns" == "yes" ]
+     then
+          appgw_fqdn="$appgw_dnsname"."$dnszone"
+          echo "Adding DNS name $appgw_fqdn for public IP $appgw_ip..."
+          az network dns record-set a create -g $dnsrg -z $dnszone -n $appgw_dnsname >/dev/null
+          az network dns record-set a add-record -g $dnsrg -z $dnszone -n $appgw_dnsname -a $appgw_ip >/dev/null
+     else
+          appgw_fqdn=$(az network public-ip show -g $rg -n $appgw_pipname --query dnsSettings.fqdn -o tsv)
+     fi
      # Create App Gw
      echo "Creating app gateway $appgw_name..."
      az network application-gateway create -g $rg -n $appgw_name \
@@ -296,23 +309,46 @@ fi
 #    az extension add --source https://aksvnodeextension.blob.core.windows.net/aks-virtual-node/aks_virtual_node-0.2.0-py2.py3-none-any.whl
 # virtual-node cannot be apparently enabled at creation time, --subnet-name is not recognized as argument
 
-# Wait for Azure cluster to finish
-if [ "$create_azure" == "yes" ]
-then
-     echo "Waiting for cluster $aksname_azure to finish provisioning (this could take a few minutes)..."
+# Function to wait until a resource is provisioned:
+# Arguments:
+# - resource id
+function WaitUntilFinsihed {
+     resource_id=$1
+     echo "Waiting for resource $resource_id to finish provisioning..."
      start_time=`date +%s`
-     state=$(az aks show -n $aksname_azure -g $rg --query provisioningState -o tsv)
+     state=$(az resource show --id $resource_id --query properties.provisioningState -o tsv)
      until [ "$state" == "Succeeded" ] || [ "$state" == "Failed" ] || [ -z "$state" ]
      do
           sleep $wait_interval
-          state=$(az aks show -n $aksname_azure -g $rg --query provisioningState -o tsv)
+          state=$(az resource show --id $resource_id --query properties.provisioningState -o tsv)
      done
      if [ -z "$state" ]
      then
           echo "Something bad happened..."
      else
-          echo "Cluster $aksname_azure provisioning state is $state, wait time $(expr `date +%s` - $start_time) seconds"
+          echo "Resource $resource_id provisioning state is $state, wait time $(expr `date +%s` - $start_time) seconds"
      fi
+}
+
+# Wait for Azure cluster to finish
+if [ "$create_azure" == "yes" ]
+then
+     # echo "Waiting for cluster $aksname_azure to finish provisioning (this could take a few minutes)..."
+     # start_time=`date +%s`
+     # state=$(az aks show -n $aksname_azure -g $rg --query provisioningState -o tsv)
+     # until [ "$state" == "Succeeded" ] || [ "$state" == "Failed" ] || [ -z "$state" ]
+     # do
+     #      sleep $wait_interval
+     #      state=$(az aks show -n $aksname_azure -g $rg --query provisioningState -o tsv)
+     # done
+     # if [ -z "$state" ]
+     # then
+     #      echo "Something bad happened..."
+     # else
+     #      echo "Cluster $aksname_azure provisioning state is $state, wait time $(expr `date +%s` - $start_time) seconds"
+     # fi
+     resource_id=$(az aks show -g $aksname_azure -n $rg --query id -o tsv)
+     WaitUntilFinished $resource_id
 fi
 
 # Wait for Kubenet cluster to finish
@@ -369,12 +405,14 @@ then
      az aks nodepool add -g $rg --cluster-name $aksname_azure --os-type Windows -n winnp -c 1 -k $k8sversion >/dev/null
 fi
 
-# Get credentials
+# Get credentials (first for kubenet, then for azure, in case both are deployed default will be azure cni)
+if [ "$create_kubenet" == "yes" ]
+then
+     az aks get-credentials -g $rg -n $aksname_kubenet --overwrite
+fi
 if [ "$create_azure" == "yes" ]
 then
      az aks get-credentials -g $rg -n $aksname_azure --overwrite
-else
-     az aks get-credentials -g $rg -n $aksname_kubenet --overwrite
 fi
 
 # Set Azure identity for app gw
@@ -448,25 +486,52 @@ then
      az aks enable-addons -g $rg -n $aksname_azure --addons virtual-node --subnet-name $subnet_aci
 fi
 
-# Print information to handle Azure CNI cluster
-if [ "$create_azure" == "yes" ]
+# If the ingress controller is not the app gateway, add the app routing addon to the Azure cluster or the kubenet cluster
+if [ "$create_appgw" != "yes" ] && [ "$create_azure" == "yes"  ]
 then
-     # echo "To enable virtual-node on $aksname_azure:"
-     # echo "  az aks enable-addons -g $rg -n $aksname_azure --addons virtual-node --subnet-name $subnet_aci"
-     echo "To enable HTTP application routing addon:"
-     echo "  az aks enable-addons -g $rg -n $aksname_azure --addons http_application_routing"
-     echo "To put credentials for $aksname_azure in your kube.config:"
-     echo "  az aks get-credentials -g $rg -n $aksname_azure --overwrite"
+     az aks enable-addons -g $rg -n $aksname_azure --addons http_application_routing 2>/dev/null
+fi
+if [ "$create_appgw" != "yes" ] && [ "$create_kubenet" == "yes"  ]
+then
+     az aks enable-addons -g $rg -n $aksname_kubenet --addons http_application_routing 2>/dev/null
 fi
 
-# Print information to handle Kubenet cluster
-if [ "$create_kubenet" == "yes" ]
+# Deploy sample apps, depending of the scenario
+if [ "$create_appgw" == "yes" ]
 then
-     echo "To enable HTTP application routing addon:"
-     echo "  az aks enable-addons -g $rg -n $aksname_kubenet --addons http_application_routing"
-     echo "To put credentials for $aksname_kubenet in your kube.config:"
-     echo "  az aks get-credentials -g $rg -n $aksname_kubenet --overwrite"
+     # kuard, port 8080
+     # sample_filename=sample-kuard-appgw.yaml
+     # wget https://raw.githubusercontent.com/erjosito/deploy-aks/master/samples/kuard-appgw.yaml -O $sample_filename 2>/dev/null 
+     # sed -i "s|<host_fqdn>|${appgw_fqdn}|g" $sample_filename
+     # kubectl apply -f $sample_filename
+     # sample aspnet app, port 80
+     sample_filename=sample-aspnet-appgw.yaml
+     wget https://raw.githubusercontent.com/erjosito/deploy-aks/master/samples/aspnet-appgw.yaml -O $sample_filename 2>/dev/null 
+     sed -i "s|<host_fqdn>|${appgw_fqdn}|g" $sample_filename
+     kubectl apply -f $sample_filename
 fi
+
+
+
+# Print information to handle Azure CNI cluster
+# if [ "$create_azure" == "yes" ]
+# then
+#      # echo "To enable virtual-node on $aksname_azure:"
+#      # echo "  az aks enable-addons -g $rg -n $aksname_azure --addons virtual-node --subnet-name $subnet_aci"
+#      echo "To enable HTTP application routing addon:"
+#      echo "  az aks enable-addons -g $rg -n $aksname_azure --addons http_application_routing"
+#      echo "To put credentials for $aksname_azure in your kube.config:"
+#      echo "  az aks get-credentials -g $rg -n $aksname_azure --overwrite"
+# fi
+
+# Print information to handle Kubenet cluster
+# if [ "$create_kubenet" == "yes" ]
+# then
+#      echo "To enable HTTP application routing addon:"
+#      echo "  az aks enable-addons -g $rg -n $aksname_kubenet --addons http_application_routing"
+#      echo "To put credentials for $aksname_kubenet in your kube.config:"
+#      echo "  az aks get-credentials -g $rg -n $aksname_kubenet --overwrite"
+# fi
 
 # Print info to connect to test VM
 if [ "$create_vm" == "yes" ]
