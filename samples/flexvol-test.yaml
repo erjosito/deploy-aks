@@ -2,7 +2,8 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: <pod_name>
-  label: <pod_label>
+  labels:
+    aadpodidbinding: <flexvol_selector>
 spec:
   containers:
   - name: nginx-flex-kv
