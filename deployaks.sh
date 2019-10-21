@@ -97,6 +97,10 @@ do
                create_vnode=yes
                shift # past argument with no value
                ;;
+          --flexvol|-f)
+               flexvol=yes
+               shift # past argument with no value
+               ;;
           --help|-h)
                help=yes
                shift # past argument with no value
@@ -128,16 +132,17 @@ fi
 # If the --help flag was issued, show help message and stop right here
 if [ "$help" == "yes" ]
 then
-     echo "Please run this script as \"source $0 [--mode=kubenet|azure] [--network-policy=azure|calico|none] [--resource-group=yourrg] [--vnet-peering] [--kubernetes-version=x.x.x] [--windows] [--appgw] [--vm] [--virtual-node]\""
+     echo "Please run this script as \"source $0 [--mode=kubenet|azure] [--network-policy=azure|calico|none] [--resource-group=yourrg] [--vnet-peering] [--kubernetes-version=x.x.x] [--windows] [--appgw] [--vm] [--virtual-node] [--flexvol]\""
      echo " -> Example: \"source $0 -m=azure -p=azure -g=akstest2\""
      exit
 fi
 
 # Message on subscription
 echo 'Getting information about Azure subscription...'
-subname=$(az account show --query name -o tsv)
-subid=$(az account show --query id -o tsv)
-echo "Working on subscription $subname ($subid)"
+subname=$(az account show --query name -o tsv) 2>/dev/null
+subid=$(az account show --query id -o tsv) 2>/dev/null
+tenantid=$(az account show --query tenantId -o tsv) 2>/dev/null
+echo "Working on subscription $subname ($subid) in tenant $tenantid"
 
 # Create resource group
 echo "Creating RG $rg..."
@@ -504,6 +509,73 @@ then
      az aks enable-addons -g $rg -n $aksname_kubenet --addons http_application_routing 2>/dev/null
 fi
 
+# AKV flexvol
+if [ "flexvol" == "yes" ]
+then
+     # AKV control plane
+     echo "Installing AKV flexvol components in the cluster..."
+     kubectl create -f https://raw.githubusercontent.com/Azure/kubernetes-keyvault-flexvol/master/deployment/kv-flexvol-installer.yaml >/dev/null
+     # AKV and secret
+     echo "Creating AKV in resource group $rg"
+     flexvol_kv_name=flexvol$RANDOM
+     az keyvault create -n $flexvol_kv_name -g $rg -l $location >/dev/null
+     flexvol_kv_id=$(az keyvault show -n $flexvol_kv_name -g $rg -o tsv --query id) 2>/dev/null
+     echo "Key Vault $flexvol_kv_id created"
+     flexvol_secret_name=flexvoltest
+     flexvol_secret_value=helloworld!
+     echo "Creating example secret in keyvault $flexvol_kv_name with value $flexvol_secret_value..."
+     az keyvault secret set -n $flexvol_secret_name --value $flexvol_secret_value --vault-name $flexvol_kv_name >/dev/null
+     # Managed identity and permissions
+     echo "Creating managed identity for AKV Flexvol..."
+     flexvol_id_name=flexvol_kv_name
+     az identity create -g $rg -n $flexvol_id_name >/dev/null
+     echo "Assigning permissions for the new identity..."
+     flexvol_id_id=$(az identity show -g $rg -n $flexvol_id_name --query id -o tsv) 2>/dev/null
+     flexvol_id_clientid=$(az identity show -g $rg -n $flexvol_id_name --query clientId -o tsv) 2>/dev/null
+     flexvol_id_principalid=$(az identity show -g $rg -n $flexvol_id_name --query principalId -o tsv) 2>/dev/null
+     until az role assignment create --role Reader --assignee $flexvol_id_principalid --scope $flexvol_kv_id >/dev/null
+     do
+          echo "There has been an error. Retrying in $wait_interval"
+          sleep $wait_interval
+     done
+     az keyvault set-policy -n $flexvol_kv_name --secret-permissions get --spn $flexvol_id_clientid >/dev/null
+     # aadpod identity and identitybinding
+     echo "Deploying k8s pod identity for flexvol access..."
+     src_file_url=https://raw.githubusercontent.com/erjosito/deploy-aks/master/helpers/flexvol-aadpodidentity.yaml
+     dst_file_name=flexpod-aadpodidentity.yaml
+     wget $src_file_url -O $dst_file_name 2>/dev/null
+     k8s_id_name=flexvoltest
+     sed -i "s|<id_name>|$k8s_id_name|g" $dst_file_name
+     sed -i "s|<managed_identity_id>|${flexvol_id_id}|g" $dst_file_name
+     sed -i "s|<client_id>|${flexvol_id_clientid}|g" $dst_file_name
+     kubectl apply -f $dst_file_name >/dev/null
+     echo "Deploying k8s pod identity binding..."
+     flexvol_label=flexvol
+     src_file_url=https://raw.githubusercontent.com/erjosito/deploy-aks/master/helpers/flexvol-aadpodidentitybinding.yaml
+     dst_file_name=flexpod-aadpodidentitybinding.yaml
+     wget $src_file_url -O $dst_file_name 2>/dev/null
+     sed -i "s|<id_name>|$k8s_id_name|g" $dst_file_name
+     sed -i "s|<label>|${flexvol_label}|g" $dst_file_name
+     kubectl apply -f $dst_file_name >/dev/null
+     # Test pod
+     echo "Deploying test pod..."
+     flexvol_pod_name=kvtest
+     src_file_url=https://raw.githubusercontent.com/erjosito/deploy-aks/master/samples/flexvol-test.yaml
+     dst_file_name=sample-flexpod-test.yaml
+     wget $src_file_url -O $dst_file_name 2>/dev/null
+     sed -i "s|<tenant_id>|${tenantid}|g" $dst_file_name
+     sed -i "s|<sub_id>|${subid}|g" $dst_file_name
+     sed -i "s|<kv_rg>|${rg}|g" $dst_file_name
+     sed -i "s|<kv_name>|${flexvol_kv_name}|g" $dst_file_name
+     sed -i "s|<secret_name>|${flexvol_secret_name}|g" $dst_file_name
+     sed -i "s|<flexvol_selector>|${flexvol_label}|g" $dst_file_name
+     sed -i "s|<pod_name>|${flexvol_pod_name}|g" $dst_file_name
+     kubectl apply -f $dst_file_name >/dev/null
+     echo "Accessing content of file in pod..."
+     kubectl exec -it $flexvol_pod_name cat /kvmnt/$flexvol_secret_name
+     echo ""
+fi
+
 # Deploy sample apps, depending of the scenario
 echo "Installing sample apps..."
 # If both azure cni and kubenet, default to azure cni
@@ -522,10 +594,10 @@ then
      if [ "$zonename" == "$dnszone" ]
      then
           dnsrg=$(az network dns zone list -o tsv --query "[?name=='$dnszone'].resourceGroup")
-          echo "Azure DNS zone $dnszone found in resource group $dnsrg"
+          echo "Azure DNS zone $dnszone found in resource group $dnsrg, using Azure DNS for app names"
           use_azure_dns=yes
      else
-          echo "Azure DNS zone not found in subscription, using public nip.io"
+          echo "Azure DNS zone not found in subscription, using public nip.io for app names"
           use_azure_dns=no
           zonename="$appgw_ip".nip.io
      fi
@@ -533,39 +605,38 @@ else
      use_azure_dns=no
      ingress_class=addon-http-application-routing
      zonename=$(az aks show -g $rg -n $aksname --query addonProfiles.httpApplicationRouting.config.HTTPApplicationRoutingZoneName -o tsv)
+     echo "The AKS application routing add on uses its own DNS zone for DNS, in this case the zone $zonename was created"
 fi
 
 # kuard, port 8080
 sample_filename=sample-kuard-ingress.yaml
 wget https://raw.githubusercontent.com/erjosito/deploy-aks/master/samples/kuard-ingress.yaml -O $sample_filename 2>/dev/null
-app_fqdn=kuard.$zonename
+app_name=kuard
+app_fqdn=$app_name.$zonename
 sed -i "s|<host_fqdn>|${app_fqdn}|g" $sample_filename
 sed -i "s|<ingress_class>|${ingress_class}|g" $sample_filename
 kubectl apply -f $sample_filename >/dev/null
 if [ "$use_azure_dns" == "yes" ]
 then
      echo "Adding DNS name $app_fqdn for public IP $appgw_ip..."
-     az network dns record-set a create -g $dnsrg -z $dnszone -n $app_dnsname >/dev/null
-     az network dns record-set a add-record -g $dnsrg -z $dnszone -n $app_dnsname -a $appgw_ip >/dev/null
-else
-     appgw_fqdn=$(az network public-ip show -g $rg -n $appgw_pipname --query dnsSettings.fqdn -o tsv)
+     az network dns record-set a create -g $dnsrg -z $dnszone -n $app_name >/dev/null
+     az network dns record-set a add-record -g $dnsrg -z $dnszone -n $app_name -a $appgw_ip >/dev/null
 fi
-echo "You can access the sample kuard on ${app_fqdn}"
+echo "You can access the sample app $app_name on ${app_fqdn}"
 
 # sample aspnet app, port 80
 sample_filename=sample-aspnet-ingress.yaml
 wget https://raw.githubusercontent.com/erjosito/deploy-aks/master/samples/aspnet-ingress.yaml -O $sample_filename 2>/dev/null 
-app_fqdn=aspnet.$zonename
+app_name=aspnet
+app_fqdn=$app_name.$zonename
 sed -i "s|<host_fqdn>|${app_fqdn}|g" $sample_filename
 sed -i "s|<ingress_class>|${ingress_class}|g" $sample_filename
 kubectl apply -f $sample_filename >/dev/null
 if [ "$use_azure_dns" == "yes" ]
 then
      echo "Adding DNS name $app_fqdn for public IP $appgw_ip..."
-     az network dns record-set a create -g $dnsrg -z $dnszone -n $app_dnsname >/dev/null
-     az network dns record-set a add-record -g $dnsrg -z $dnszone -n $app_dnsname -a $appgw_ip >/dev/null
-else
-     appgw_fqdn=$(az network public-ip show -g $rg -n $appgw_pipname --query dnsSettings.fqdn -o tsv)
+     az network dns record-set a create -g $dnsrg -z $dnszone -n $app_name >/dev/null
+     az network dns record-set a add-record -g $dnsrg -z $dnszone -n $app_name -a $appgw_ip >/dev/null
 fi
 echo "You can access the sample aspnet app on ${app_fqdn}"
 
