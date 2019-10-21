@@ -2,7 +2,9 @@
 
 The goal of this repo is providing a way of quickly deploying Azure Kubernetes Service with some of the features supported, so that users can easily test some of the features available in the service.
 
-It essentially consists of two scripts: deployaks.sh and cleanupaks.sh
+It essentially consists of two scripts: deployaks.sh and cleanupaks.sh.
+
+**Note**: this script assumes that you have some infrastructure already there, such as an Azure Key Vault with specific secrets, an Azure Monitor workspace for logging or an Azure Container Registry for your container images. Future versions of this script might remove some of these requirements.
 
 ## Deploy AKS
 

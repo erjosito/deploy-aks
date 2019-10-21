@@ -2,7 +2,6 @@ apiVersion: apps/v1beta1
 kind: Deployment
 metadata:
   name: kuard-vnode-ingress
-  namespace: ingress
 spec:
   replicas: 2
   strategy:
@@ -39,7 +38,6 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  namespace: ingress
   name: kuard-vnode-ingress
 spec:
   type: ClusterIP
@@ -51,16 +49,15 @@ spec:
 apiVersion: extensions/v1beta1
 kind: Ingress
 metadata:
-  namespace: ingress
   name: kuard-ingress
   annotations:
-    kubernetes.io/ingress.class: addon-http-application-routing
+    kubernetes.io/ingress.class: <ingress_class>
 spec:
   rules:
-  - host: appgwtest.westeurope.cloudapp.azure.com
+  - host: <host_fqdn>
     http:
       paths:
       - backend:
           serviceName: kuard-vnode-ingress
           servicePort: 8080
-        path: /kuard/
+        path: /
