@@ -36,8 +36,8 @@
             }
         },
         "enableNodePublicIp": {
-            "type": "string",
-            "defaultValue": "false",
+            "type": "bool",
+            "defaultValue": false,
             "metadata": {
                 "description": "Whether node PIPs are deployed"
             }
