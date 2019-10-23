@@ -50,10 +50,10 @@
         "agentPoolProfiles": {
             "maxPods": 30,
             "osDiskSizeGB": 0,
-            "agentCount": 3,
+            "agentCount": 1,
             "agentVmSize": "Standard_B2ms",
             "osType": "Linux",
-            "enableNodePublicIP":"[parameters('enableNodePublicIp')]",
+            "enableNodePublicIp":"[parameters('enableNodePublicIp')]",
             "vnetSubnetId": "[parameters('vnetSubnetId')]"
         }
     },
