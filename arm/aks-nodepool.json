@@ -27,11 +27,18 @@
             "metadata": {
                 "description": "The Vnet subnet resource ID for your existing AKS cluster."
             }
+        },
+        "enableNodePublicIp": {
+            "type": "string",
+            "defaultValue": "false",
+            "metadata": {
+                "description": "Whether node PIPs are deployed"
+            }
         }
     },
     "variables": {
         "apiVersion": {
-            "aks": "2019-04-01"
+            "aks": "2019-06-01"
         },
         "agentPoolProfiles": {
             "maxPods": 30,
@@ -39,12 +46,13 @@
             "agentCount": 3,
             "agentVmSize": "Standard_DS2_v2",
             "osType": "Linux",
+            "enableNodePublicIP":"[parameters('enableNodePublicIp')]",
             "vnetSubnetId": "[parameters('vnetSubnetId')]"
         }
     },
     "resources": [
         {
-            "apiVersion": "2019-04-01",
+            "apiVersion": "2019-06-01",
             "type": "Microsoft.ContainerService/managedClusters/agentPools",
             "name": "[concat(parameters('clusterName'),'/', parameters('agentPoolName'))]",
             "location": "[parameters('location')]",
