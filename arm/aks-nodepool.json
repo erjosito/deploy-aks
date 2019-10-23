@@ -28,6 +28,13 @@
                 "description": "The Vnet subnet resource ID for your existing AKS cluster."
             }
         },
+        "orchestratorVersion": {
+            "type": "string",
+            "defaultValue": "",
+            "metadata": {
+                "description": "kubernetes version"
+            }
+        },
         "enableNodePublicIp": {
             "type": "string",
             "defaultValue": "false",
@@ -44,7 +51,7 @@
             "maxPods": 30,
             "osDiskSizeGB": 0,
             "agentCount": 3,
-            "agentVmSize": "Standard_DS2_v2",
+            "agentVmSize": "Standard_B2ms",
             "osType": "Linux",
             "enableNodePublicIP":"[parameters('enableNodePublicIp')]",
             "vnetSubnetId": "[parameters('vnetSubnetId')]"
@@ -52,7 +59,7 @@
     },
     "resources": [
         {
-            "apiVersion": "2019-06-01",
+            "apiVersion": "[variables('apiVersion').aks]",
             "type": "Microsoft.ContainerService/managedClusters/agentPools",
             "name": "[concat(parameters('clusterName'),'/', parameters('agentPoolName'))]",
             "location": "[parameters('location')]",
@@ -65,7 +72,7 @@
                 "storageProfile": "ManagedDisks",
                 "type": "VirtualMachineScaleSets",
                 "vnetSubnetID": "[variables('agentPoolProfiles').vnetSubnetId]",
-                "orchestratorVersion": "1.13.10"
+                "orchestratorVersion": "[parameters('orchestratorVersion')]"
             }
         }
     ]
