@@ -1,7 +1,7 @@
 apiVersion: apps/v1beta1
 kind: Deployment
 metadata:
-  name: kuard
+  name: kuard-alb
 spec:
   replicas: 2
   strategy:
@@ -12,7 +12,7 @@ spec:
   template:
     metadata:
       labels:
-        app: kuard
+        app: kuard-alb
     spec:
       containers:
       - name: kuard
@@ -23,11 +23,11 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: kuard
+  name: kuard-alb
 spec:
   type: LoadBalancer
   externalTrafficPolicy: "Local"
   ports:
   - port: 8080
   selector:
-    app: kuard
+    app: kuard-alb
