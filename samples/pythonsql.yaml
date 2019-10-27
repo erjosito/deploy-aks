@@ -1,0 +1,31 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pythonsql
+  namespace: default
+spec:
+  containers:
+  - image: erjositoacr.azurecr.io/pythonsql:0.2
+    imagePullPolicy: IfNotPresent
+    name: pythonsql
+    env:
+      - name: SQL_SERVER_FQDN
+        valueFrom:
+          secretKeyRef:
+            name: sqlserver
+            key: SQL_SERVER_FQDN
+      - name: SQL_SERVER_DB
+        valueFrom:
+          secretKeyRef:
+            name: sqlserver
+            key: SQL_SERVER_DB
+      - name: SQL_SERVER_USERNAME
+        valueFrom:
+          secretKeyRef:
+            name: sqlserver
+            key: SQL_SERVER_USERNAME
+      - name: SQL_SERVER_PASSWORD
+        valueFrom:
+          secretKeyRef:
+            name: sqlserver
+            key: SQL_SERVER_PASSWORD

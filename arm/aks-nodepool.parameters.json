@@ -1,0 +1,24 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2015-01-01/deploymentParameters.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "clusterName": {
+            "value": "azurecnicluster"
+        },
+        "location": {
+            "value": "westeurope"
+        },
+        "agentPoolName": {
+            "value": "armpool"
+        },
+        "orchestratorVersion": {
+            "value": "1.14.6"
+        },
+        "vnetSubnetId": {
+            "value": "/subscriptions/e7da9914-9b05-4891-893c-546cb7b0422e/resourceGroups/akstest3/providers/Microsoft.Network/vrtualNetworks/aksVnet/subnets/armpool"
+        },
+        "enableNodePublicIp": {
+            "value": true
+        }
+    }
+}

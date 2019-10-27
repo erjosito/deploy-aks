@@ -45,7 +45,7 @@
     },
     "variables": {
         "apiVersion": {
-            "aks": "2019-06-01"
+            "aks": "2019-08-01"
         },
         "agentPoolProfiles": {
             "maxPods": 30,
@@ -72,7 +72,8 @@
                 "storageProfile": "ManagedDisks",
                 "type": "VirtualMachineScaleSets",
                 "vnetSubnetID": "[variables('agentPoolProfiles').vnetSubnetId]",
-                "orchestratorVersion": "[parameters('orchestratorVersion')]"
+                "orchestratorVersion": "[parameters('orchestratorVersion')]",
+                "enableNodePublicIp": "[variables('agentPoolProfiles').enableNodePublicIp]"
             }
         }
     ]
