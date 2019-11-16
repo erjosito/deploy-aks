@@ -2,6 +2,7 @@
 
 ###############################################################
 # To Do:
+# - Azure Policy
 # - AzFw (ongoing)
 #   * enable logging to azmon ws (done)
 #   * KQL from cli -> not supported
@@ -35,13 +36,18 @@ script_start_time=`date +%s`
 
 # Check requirements
 echo "Checking script dependencies..."
-requirements=(az jq kubectl helm)
+requirements=(az jq kubectl helm2 helm3)
 for req in ${requirements[@]}
 do
      if [ -z $(which $req) ]
      then
           echo "Please install $req to run this script"
-          return
+          if [[ "${BASH_SOURCE[0]}" != "${0}" ]]
+          then
+               return
+          else
+               exit
+          fi
      else
           echo "- $req executable found in $(which $req)"
      fi
@@ -61,7 +67,7 @@ fi
 # Loading values for variables from a config file
 source ./deployaks_variables.sh
 
-# Defaults
+# Defaults (moving this to an external file like the variables would probably make sense)
 k8s_version=latest
 help=no
 vnetpeering=no
@@ -83,6 +89,19 @@ deploy_linkerd=no
 k8s_version_preview=yes
 aks_api_fw=no
 global_lb=tm
+deploy_arc=no
+deploy_ca=no
+azure_policy=no
+attach_acr=yes
+helm_version=2
+min_node_count=1
+max_node_count=3
+max_retries=10
+
+# Format variables
+normal="\e[0m"
+underline="\e[4m"
+yellow="\e[33m"
 
 # Argument parsing (can overwrite the previously initialized variables)
 for i in "$@"
@@ -98,6 +117,10 @@ do
                ;;
           -k=*|--kubernetes-version=*)
                k8s_version="${i#*=}"
+               shift # past argument=value
+               ;;
+          -c=*|--node-count=*)
+               min_node_count="${i#*=}"
                shift # past argument=value
                ;;
           --no-k8s-version-preview)
@@ -204,6 +227,22 @@ do
                global_lb=afd
                shift # past argument with no value
                ;;
+          --arc)
+               deploy_arc=yes
+               shift # past argument with no value
+               ;;
+          --ca)
+               deploy_ca=yes
+               shift # past argument with no value
+               ;;
+          --policy)
+               azure_policy=yes
+               shift # past argument with no value
+               ;;
+          --no-acr)
+               attach_acr=no
+               shift # past argument with no value
+               ;;
           --help|-h)
                help=yes
                shift # past argument with no value
@@ -230,10 +269,10 @@ then
          [--network-policy=azure|calico|none] [--vnet-peering] [--azfw] [--aks-api-fw] [--apim]
          [--windows] [--appgw] [--app-routing] [--helm]
          [--db] [--db-location]
-         [--lb-outbound-rules] [--lb-basic] [--no-vmss] [--afd]
-         [--extra-nodepool]
-         [--linkerd] [--ilpip]
-         [--virtual-node] [--flexvol] [--aad-pod-identity]\""
+         [--lb-outbound-rules] [--lb-basic] [--ilpip] [--no-vmss] [--afd]
+         [--extra-nodepool] [--policy] [--arc]
+         [--linkerd]
+         [--virtual-node] [--flexvol] [--aad-pod-identity] [--ca]\""
      echo " -> Example: \"$script_name -n=azure -p=azure -g=akstest\""
      # Return if the script is sourced, exit if it is not
      #read -p "Press enter to continue"
@@ -243,6 +282,14 @@ then
      else
           exit
      fi
+fi
+
+# Variable for helm exec
+if [ "$helm_version" == "2" ]
+then
+     helm_exec=helm2
+else
+     helm_exec=helm3
 fi
 
 # Identify if more than one location (comma-separated) was supplied
@@ -481,6 +528,24 @@ fi
 if [ "$windows" == "yes" ]
 then
      windows_options="--windows-admin-password "$default_password" --windows-admin-username $adminuser"
+else
+     windows_options=""
+fi
+
+# Define cluster-autoscaler options
+if [ "$deploy_ca" == "yes" ]
+then
+     ca_options="--enable-cluster-autoscaler --min-count $min_node_count --max-count $max_node_count"
+else
+     ca_options=""
+fi
+
+# Define cluster-autoscaler options
+if [ "$attach_acr" == "yes" ]
+then
+     acr_options="--attach-acr $acr_id"
+else
+     acr_options=""
 fi
 
 # Override some values that are not supported by kubenet
@@ -527,7 +592,8 @@ do
      echo "The AKS subnet ID is $subnetid"
      # Cluster
      echo "Creating AKS cluster $this_aksname in resource group $rg..."
-     az aks create -g $rg -n $this_aksname -c 1 -s $vmsize -k $k8s_version \
+     az aks create -g $rg -n $this_aksname -l $this_location \
+          -c $min_node_count -s $vmsize -k $k8s_version \
           --service-principal $appid --client-secret $appsecret \
           --admin-username $adminuser --ssh-key-value "$sshpublickey" \
           --network-plugin $network_plugin --vnet-subnet-id $subnetid --service-cidr $aks_service_cidr \
@@ -535,7 +601,8 @@ do
           --network-policy "$nw_policy" \
           $vmss_options \
           $windows_options \
-          --attach-acr "$acr_id" \
+          $ca_options \
+          $acr_options \
           --load-balancer-sku $lb_sku \
           --node-resource-group "$this_aksname"-iaas-"$RANDOM" \
           --tags "$tag1_name"="$tag1_value" \
@@ -617,7 +684,6 @@ do
           az apim create -n $this_apim_name -g $rg -l $this_location --sku-name $apim_sku >/dev/null
      fi
 
-
      # Test VM
      # It is not created in --no-wait mode, since probably we need to wait for the creation of the AKS cluster any way....
      if [ "$create_vm" == "yes" ]
@@ -690,20 +756,15 @@ function WaitUntilFinished {
      done
      if [ -z "$state" ]
      then
-          echo "Something bad happened..."
+          echo "Something really bad happened..."
+          if [[ "${BASH_SOURCE[0]}" != "${0}" ]]
+          then
+               return
+          else
+               exit
+          fi
      else
           echo "Resource $resource_name provisioning state is $state, wait time $(expr `date +%s` - $start_time) seconds"
-          if [ "$state" == "Failed" ]
-          then
-               echo "Exiting..."
-               # Return if the script is sourced, exit if it is not
-               if [[ "${BASH_SOURCE[0]}" != "${0}" ]]
-               then
-                    return
-               else
-                    exit
-               fi
-          fi
      fi
 }
 
@@ -724,8 +785,44 @@ do
      # AKS cluster
      resource_id=$(az aks show -n $this_aksname -g $rg --query id -o tsv)
      WaitUntilFinished $resource_id
+     if [ "$state" == "Failed" ]
+     then
+          echo "Exiting..."
+          # Return if the script is sourced, exit if it is not
+          if [[ "${BASH_SOURCE[0]}" != "${0}" ]]
+          then
+               return
+          else
+               exit
+          fi
+     fi
      echo "Getting credentials for cluster $this_aksname..."
      az aks get-credentials -g $rg -n $this_aksname --overwrite
+
+     # Onboard to Azure Policy if required
+     if [ "$azure_policy" == "yes" ]
+     then
+          # Enable addon
+          echo "Configuring integration with Azure Policy..."
+          az aks enable-addons --addons azure-policy -n $this_aksname -g $rg >/dev/null
+          # Assign sample policy that rejects privileged pods: first see if the policy exists
+          rgid=$(az group show -n $rg --query id -o tsv) 2>/dev/null
+          assignment_name=sample-k8s-policy
+          assignment_description="Sample kubernetes policy to reject privileged pods"
+          policy_id='/providers/Microsoft.Authorization/policyDefinitions/7ce7ac02-a5c6-45d6-8d1b-844feb1c1531'
+          policy_name=$(az policy definition list --query "[?id=='$policy_id'].name" -o tsv 2>/dev/null)
+          policy_display_name=$(az policy definition list --query "[?id=='$policy_id'].displayName" -o tsv 2>/dev/null)
+          if [ -z "$policy_name" ]
+          then
+               echo "Policy $policy_id not found!"
+          else
+               echo "Assigning sample policy $policy_display_name to scope $rgid..."
+               az policy assignment create -n $assignment_name --display-name "$assignment_description" --scope "$rgid" --policy "$policy_name" -l $rg_location >/dev/null
+          fi
+          # Deploy sample manifest
+          echo "Deploying sample pod with elevated privilege, it should be rejected by the policy"
+          kubectl apply -f https://raw.githubusercontent.com/erjosito/deploy-aks/master/samples/privileged.yaml
+     fi
 
      # Configure logging for the master nodes
      echo "Enabling logging for AKS master nodes in $this_aksname to log to analytics workspace $monitor_ws..."
@@ -850,45 +947,47 @@ do
           echo "No app gw to configure autoscaling for cluster $this_aksname"
      fi
 
-     # Connect route-table to AKS cluster
-     noderg=$(az aks show -g $rg -n $this_aksname --query nodeResourceGroup -o tsv) 2>/dev/null
-     # Look for an existing route table (there should be one for kubenet clusters)
-     aks_rt_id=$(az network route-table list -g $noderg --query [0].id -o tsv) 2>/dev/null
-     # If none is found, create one
-     if [ -z "$aks_rt_id" ]
+     # Connect route-table to AKS cluster (only needed if we have an az fw or a kubenet cluster)
+     if [ "$create_azfw" == "yes" ] || [ "$network_plugin" == "kubenet" ]
      then
-          echo "Creating route table $this_aks_rt_name..."
-          az network route-table create -n $this_aks_rt_name -g $noderg -l $this_location >/dev/null
-          aks_rt_id=$(az network route-table show -n $this_aks_rt_name -g $noderg -o tsv --query id)
-     else
-          echo "Found existing route table $aks_rt_id"
-     fi
-     # See if it is already associated to the aks subnet
-     associated_rt_id=$(az network vnet subnet show --vnet-name $this_vnet_name -g $rg -n $aks_subnet_name -o tsv --query routeTable)
-     # If no route table associated, associate the route table (either the one found, or the newly created one)
-     if [ -z "$associated_rt_id" ]
-     then
-          echo "Associating AKS subnet $aks_subnet_name with route table $aks_rt_id..."
-          az network vnet subnet update -g $rg --vnet-name $this_vnet_name -n $aks_subnet_name --route-table $aks_rt_id >/dev/null
-     else
-          echo "AKS subnet $aks_subnet_name already associated to route table $associated_rt_id"
-     fi
-     # Send vnet traffic to the firewall
-     if [ "$create_azfw" == "yes" ]
-     then
-          # Rule with IP address for master node
-          kubectl config use-context $this_aksname
-          hcp_ip=$(kubectl get endpoints -o=jsonpath='{.items[?(@.metadata.name == "kubernetes")].subsets[].addresses[].ip}')
-          echo "AKS API IP addresses seems to be $hcp_ip, adding to Azure Firewall..."
-          az network firewall network-rule create -f $this_azfw_name -g $rg -c AKS-egress --protocols Tcp --destination-addresses $hcp_ip --destination-ports 22 443 9000 --source-addresses $aks_subnet_prefix -n ControlPlane >/dev/null
+          noderg=$(az aks show -g $rg -n $this_aksname --query nodeResourceGroup -o tsv) 2>/dev/null
+          # Look for an existing route table (there should be one for kubenet clusters)
+          aks_rt_id=$(az network route-table list -g $noderg --query [0].id -o tsv) 2>/dev/null
+          # If none is found, create one
+          if [ -z "$aks_rt_id" ]
+          then
+               echo "Creating route table $this_aks_rt_name..."
+               az network route-table create -n $this_aks_rt_name -g $noderg -l $this_location >/dev/null
+               aks_rt_id=$(az network route-table show -n $this_aks_rt_name -g $noderg -o tsv --query id)
+          else
+               echo "Found existing route table $aks_rt_id"
+          fi
+          # See if it is already associated to the aks subnet
+          associated_rt_id=$(az network vnet subnet show --vnet-name $this_vnet_name -g $rg -n $aks_subnet_name -o tsv --query routeTable)
+          # If no route table associated, associate the route table (either the one found, or the newly created one)
+          if [ -z "$associated_rt_id" ]
+          then
+               echo "Associating AKS subnet $aks_subnet_name with route table $aks_rt_id..."
+               az network vnet subnet update -g $rg --vnet-name $this_vnet_name -n $aks_subnet_name --route-table $aks_rt_id >/dev/null
+          else
+               echo "AKS subnet $aks_subnet_name already associated to route table $associated_rt_id"
+          fi
+          # Send vnet traffic to the firewall
+          if [ "$create_azfw" == "yes" ]
+          then
+               # Rule with IP address for master node
+               kubectl config use-context $this_aksname
+               hcp_ip=$(kubectl get endpoints -o=jsonpath='{.items[?(@.metadata.name == "kubernetes")].subsets[].addresses[].ip}')
+               echo "AKS API IP addresses seems to be $hcp_ip, adding to Azure Firewall..."
+               az network firewall network-rule create -f $this_azfw_name -g $rg -c AKS-egress --protocols Tcp --destination-addresses $hcp_ip --destination-ports 22 443 9000 --source-addresses $aks_subnet_prefix -n ControlPlane >/dev/null
 
-          # Find out the name of the route table (we only had the ID) and add the route
-          # Not using $this_aks_rt_name because the route table name would be different for kubenet clusters
-          retrieved_aks_rt_name=$(az network route-table list -g $noderg --query [0].name -o tsv 2>/dev/null)  # Searching for the ID would be more accurate
-          az network route-table route create -n vnet --route-table-name $retrieved_aks_rt_name -g $noderg --next-hop-type VirtualAppliance --address-prefix $vnetprefix --next-hop-ip-address $azfw_private_ip >/dev/null
-          az network route-table route create -n defaultRoute --route-table-name $retrieved_aks_rt_name -g $noderg --next-hop-type VirtualAppliance --address-prefix "0.0.0.0/0" --next-hop-ip-address $azfw_private_ip >/dev/null
+               # Find out the name of the route table (we only had the ID) and add the route
+               # Not using $this_aks_rt_name because the route table name would be different for kubenet clusters
+               retrieved_aks_rt_name=$(az network route-table list -g $noderg --query [0].name -o tsv 2>/dev/null)  # Searching for the ID would be more accurate
+               az network route-table route create -n vnet --route-table-name $retrieved_aks_rt_name -g $noderg --next-hop-type VirtualAppliance --address-prefix $vnetprefix --next-hop-ip-address $azfw_private_ip >/dev/null
+               az network route-table route create -n defaultRoute --route-table-name $retrieved_aks_rt_name -g $noderg --next-hop-type VirtualAppliance --address-prefix "0.0.0.0/0" --next-hop-ip-address $azfw_private_ip >/dev/null
+          fi
      fi
-
 
      # Add Windows pool to AKS cluster if required
      if [ "$windows" == "yes" ]
@@ -983,31 +1082,64 @@ do
           fi
      fi
 
-     # Enable Helm if explicitly requested, or if required by other apps (AGIC, nginx ingress)
-     if [ "$enable_helm" == "yes" ] || [ "$create_appgw" == "yes" ] || [ "$deploy_nginx_ingress" == "yes" ]
+     # Enable Helm if explicitly requested, or if required by other apps (AGIC, nginx ingress, policy)
+     if [ "$helm_version" == "2" ]
      then
-          if [ "$aks_rbac" == "yes" ]
+          if [ "$enable_helm" == "yes" ] || [ "$create_appgw" == "yes" ] || [ "$deploy_nginx_ingress" == "yes" ] || [ "$deploy_arc" == "yes" ]
           then
-               echo "Enabling Helm for RBAC cluster $this_aksname..."
-               kubectl config use-context $this_aksname
-               kubectl create serviceaccount --namespace kube-system tiller-sa >/dev/null
-               kubectl create clusterrolebinding tiller-cluster-rule --clusterrole=cluster-admin --serviceaccount=kube-system:tiller-sa >/dev/null
-               helm init --tiller-namespace kube-system --service-account tiller-sa >/dev/null
-          else
-               echo "Enabling Helm for non-RBAC cluster $this_aksname..."
-               helm init >/dev/null
+               if [ "$aks_rbac" == "yes" ]
+               then
+                    echo "Enabling Helm for RBAC cluster $this_aksname..."
+                    kubectl config use-context $this_aksname
+                    kubectl create serviceaccount --namespace kube-system tiller-sa >/dev/null
+                    kubectl create clusterrolebinding tiller-cluster-rule --clusterrole=cluster-admin --serviceaccount=kube-system:tiller-sa >/dev/null
+                    echo "Initializing helm2 with tiller..."
+                    helm2 init --tiller-namespace kube-system --service-account tiller-sa >/dev/null
+               else
+                    echo "Enabling Helm for non-RBAC cluster $this_aksname..."
+                    helm2 init >/dev/null
+               fi
+               # Check that tiller has deployed successfully
+               retry_count=0
+               until [ "$(kubectl get deploy/tiller-deploy -n kube-system -o json | jq -rc '.status.readyReplicas')" == "1" ]
+               do
+                    if (( $retry_count > $max_retries ))
+                    then
+                         "Maximum retries, tiller pod not ready, something went wrong..."
+                         if [[ "${BASH_SOURCE[0]}" != "${0}" ]]
+                         then
+                              return
+                         else
+                              exit
+                         fi
+                    fi
+                    echo "Tiller pod not ready. Waiting $wait_interval..."
+                    sleep $wait_interval
+                    retry_count=$(( $retry_count + 1 ))
+               done
+               echo "Tiller pod ready in cluster $this_aksname"
           fi
+     fi
+
+     # Onboard to ARC if required (helm3 only)
+     if [ "$deploy_arc" == "yes" ]
+     then
+          this_aksname_arc="$this_aksname"-arc
+          echo "Deploying helm chart for ARC integration as connected cluster $this_aksname_arc in resource group $rg..."
+          helm3 repo add haikupreview https://haikupreview.azurecr.io/helm/v1/repo >/dev/null
+          helm3 fetch haikupreview/haiku-agents >/dev/null
+          helm3 upgrade haiku haiku-agents-0.1.6.tgz --install --set global.subscriptionId=${subid},global.resourceGroupName=${rg},global.resourceName=${this_aksname_arc},global.location=${this_location},global.tenantId=${tenantid},global.clientId=${id},global.clientSecret=${appsecret} >/dev/null
      fi
 
      # Add helm repo for App GW Ingress Controller
      if [ "$create_appgw" == "yes" ]
      then
           echo "Adding helm repos for AGIC in cluster $this_aksname..."
-          helm repo add application-gateway-kubernetes-ingress https://appgwingress.blob.core.windows.net/ingress-azure-helm-package/ >/dev/null
-          helm repo update >/dev/null
+          $helm_exec repo add application-gateway-kubernetes-ingress https://appgwingress.blob.core.windows.net/ingress-azure-helm-package/ >/dev/null
+          $helm_exec repo update >/dev/null
           kubectl config use-context $this_aksname
           master_ip=$(kubectl cluster-info | grep master | cut -d/ -f3 | cut -d: -f 1 2>/dev/null)
-          echo "Installing helm chart for AGIC for master IP address $master_ip..."
+          echo "Installing helm chart for AGIC for master IP address $master_ip with helm version $helm_version..."
           wget https://raw.githubusercontent.com/Azure/application-gateway-kubernetes-ingress/master/docs/examples/sample-helm-config.yaml -O helm-config.yaml 2>/dev/null
           sed -i "s|<subscriptionId>|${subid}|g" helm-config.yaml
           sed -i "s|<resourceGroupName>|${rg}|g" helm-config.yaml
@@ -1016,7 +1148,12 @@ do
           sed -i "s|<identityClientId>|${appgw_identity_clientid}|g" helm-config.yaml
           sed -i "s|<aks-api-server-address>|${master_ip}|g" helm-config.yaml
           sed -i "s|enabled: false|enabled: true|g" helm-config.yaml
-          helm install -f helm-config.yaml application-gateway-kubernetes-ingress/ingress-azure >/dev/null
+          if [ "$helm_version" == "2" ]
+          then
+               $helm_exec install -f helm-config.yaml application-gateway-kubernetes-ingress/ingress-azure >/dev/null
+          else
+               $helm_exec install agic -f helm-config.yaml application-gateway-kubernetes-ingress/ingress-azure >/dev/null
+          fi
      fi
 
      # Enable virtual node (verify that CNI plugin is Azure?)
@@ -1053,12 +1190,12 @@ do
                manifest_filename=nginx-ingress-internal.yaml
                wget $manifest_url -O $manifest_filename 2>/dev/null
                sed -i "s|<lb_private_ip>|${nginx_ingress_private_ip}|g" $manifest_filename
-               helm install stable/nginx-ingress --namespace $nginx_ingress_ns_name -f $manifest_filename \
+               helm install nginx stable/nginx-ingress --namespace $nginx_ingress_ns_name -f $manifest_filename \
                          --set controller.replicaCount=2 --set controller.nodeSelector."beta\.kubernetes\.io/os"=linux \
                          --set defaultBackend.nodeSelector."beta\.kubernetes\.io/os"=linux >/dev/null
           else
                # External ingress controller (default for helm)
-               helm install stable/nginx-ingress --namespace $nginx_ingress_ns_name \
+               helm install nginx stable/nginx-ingress --namespace $nginx_ingress_ns_name \
                          --set controller.replicaCount=2 --set controller.nodeSelector."beta\.kubernetes\.io/os"=linux \
                          --set defaultBackend.nodeSelector."beta\.kubernetes\.io/os"=linux >/dev/null
           fi
@@ -1199,6 +1336,20 @@ fi
 # Deploy sample apps, depending of the scenario
 echo "Installing sample apps..."
 
+# Decide if using a DNS zone to publish names (if the one specified in the variables exists) or use nip.io
+zonename=$(az network dns zone list -o tsv --query "[?name=='$dnszone'].name" 2>/dev/null)
+if [ "$zonename" == "$dnszone" ]
+then
+     dnsrg=$(az network dns zone list -o tsv --query "[?name=='$dnszone'].resourceGroup")
+     echo "Azure DNS zone $dnszone found in resource group $dnsrg, using Azure DNS for app names"
+     use_azure_dns=yes
+else
+     echo "Azure DNS zone $dnszone not found in subscription, using public zone $ingress_ip.nip.io for app names"
+     use_azure_dns=no
+     zonename="$ingress_ip".nip.io
+fi
+
+
 # Create Azure Traffic Manager profile if there is an ingress controller and there is more than one location
 # In order to test, having an ingress controller should not be a requirement...
 if (( "$number_of_clusters" > 1 ))
@@ -1211,15 +1362,41 @@ then
                # kuard
                app_name=kuard
                kuard_tm_dns="$app_name""$RANDOM"
-               kuard_tm_fqdn="$tm_dns".trafficmanager.net
+               kuard_tm_fqdn="$kuard_tm_dns".trafficmanager.net
                az network traffic-manager profile create -n $kuard_tm_dns -g $rg --routing-method $tm_routing --unique-dns-name $kuard_tm_dns >/dev/null
-               echo "Created Traffic Manager profile on $kuard_tm_fqdn with routing type $tm_routing"
+               echo "Created Traffic Manager profile on ${yellow}${kuard_tm_fqdn}${normal} with routing type $tm_routing"
+               if [ "$use_azure_dns" == "yes" ]
+               then
+                    echo "Adding DNS CNAME $app_name in zone $dnszone for FQDN $kuard_tm_fqdn..."
+                    # Remove any existing A recordset if required
+                    record_set_name=$(az network dns record-set a show -z $dnszone -g $dnsrg -n $app_name --query name -o tsv 2>/dev/null)
+                    if [ -n "$record_set_name" ]
+                    then
+                         echo "Deleting existing A recordset $record_set_name before being able to add CNAME recordset..."
+                         az network dns record-set a delete -z $dnszone -g $dnsrg -n $app_name -y >/dev/null
+                    fi
+                    az network dns record-set cname create -g $dnsrg -z $dnszone -n $app_name >/dev/null
+                    az network dns record-set cname set-record -g $dnsrg -z $dnszone -n $app_name -c $kuard_tm_fqdn >/dev/null
+               fi
                # aspnet
                app_name=aspnet
                aspnet_tm_dns="$app_name""$RANDOM"
-               aspnet_tm_fqdn="$tm_dns".trafficmanager.net
+               aspnet_tm_fqdn="$aspnet_tm_dns".trafficmanager.net
                az network traffic-manager profile create -n $aspnet_tm_dns -g $rg --routing-method $tm_routing --unique-dns-name $aspnet_tm_dns >/dev/null
-               echo "Created Traffic Manager profile on $aspnet_tm_fqdn with routing type $tm_routing"
+               echo "Created Traffic Manager profile on ${yellow}${aspnet_tm_fqdn}${normal} with routing type $tm_routing"
+               if [ "$use_azure_dns" == "yes" ]
+               then
+                    echo "Adding DNS CNAME $app_name in zone $dnszone for FQDN $aspnet_tm_fqdn..."
+                    # Remove any existing A recordset if required
+                    record_set_name=$(az network dns record-set a show -z $dnszone -g $dnsrg -n $app_name --query name -o tsv 2>/dev/null)
+                    if [ -n "$record_set_name" ]
+                    then
+                         echo "Deleting existing A recordset $record_set_name before being able to add CNAME recordset..."
+                         az network dns record-set a delete -z $dnszone -g $dnsrg -n $app_name -y >/dev/null
+                    fi
+                    az network dns record-set cname create -g $dnsrg -z $dnszone -n $app_name >/dev/null
+                    az network dns record-set cname set-record -g $dnsrg -z $dnszone -n $app_name -c $aspnet_tm_fqdn >/dev/null
+               fi
           else
                # Azure Front Door: https://docs.microsoft.com/en-us/cli/azure/ext/front-door/network/front-door?view=azure-cli-latest
                echo "Azure Front Door not implemented yet!"
@@ -1242,7 +1419,7 @@ do
      this_vnet_name="$vnet"-"$this_location"
      this_aksname="$aksname"-"$this_location"
      this_appgw_name="$appgw_name"-"$this_location"
-     this_appgw_pipname="$apggw_pipname"-"$this_location"
+     this_appgw_pipname="$appgw_pipname"-"$this_location"
      this_azfw_name="$azfw_name"-"$this_location"
      this_azfw_pipname="$azfw_pipname"-"$this_location"
 
@@ -1258,7 +1435,7 @@ do
                     # What if the nginx controller is frontended by a firewall? The IP address should be that of the AzFw...
                     if [ "$create_azfw" == "yes" ]
                     then
-                         ingress_ip=$(az network public-ip show -g $rg -n $this_azfw_pipname --query ipAddress -o tsv 2>/dev/null)
+                         ingress_ip=$(az network public-ip show -g $rg -n $this_appgw_pipname --query ipAddress -o tsv 2>/dev/null)
                          echo "Region $this_location seems to be configured with an Azure Firewall in front of ngnix, with publi IP $ingress_ip"
                     else
                          nginx_ingress_svc_name=ingress-nginx-ingress-controller
@@ -1272,18 +1449,6 @@ do
                     ingress_ip=$(az network public-ip show -g $rg -n $this_appgw_pipname --query ipAddress -o tsv)
                     echo "Region $this_location seems to be configured with an app gateway ingress controller, with IP $ingress_ip"
                fi
-               # Decide if using a DNS zone to publish names (if the one specified in the variables exists) or use nip.io
-               zonename=$(az network dns zone list -o tsv --query "[?name=='$dnszone'].name" 2>/dev/null)
-               if [ "$zonename" == "$dnszone" ]
-               then
-                    dnsrg=$(az network dns zone list -o tsv --query "[?name=='$dnszone'].resourceGroup")
-                    echo "Azure DNS zone $dnszone found in resource group $dnsrg, using Azure DNS for app names"
-                    use_azure_dns=yes
-               else
-                    echo "Azure DNS zone $dnszone not found in subscription, using public zone $ingress_ip.nip.io for app names"
-                    use_azure_dns=no
-                    zonename="$ingress_ip".nip.io
-               fi
           else
                ingress_class=addon-http-application-routing
                use_azure_dns=no
@@ -1293,20 +1458,30 @@ do
      fi
 
      # Select the right k8s context
-     kubectl config set-context $this_aksname
+     kubectl config use-context $this_aksname
 
      # kuard, port 8080, ingress (there has to be an ingress controller)
      if [ "$create_appgw" == "yes" ] || [ "$enable_approuting_addon" == "yes" ] || [ $deploy_nginx_ingress == "yes" ]
      then
           app_name=kuard
-          this_app_name="$app_name"-"$this_location"
+          # If we are routing with TM, the FQDN for each cluster should be the same
+          if (( "$number_of_clusters" > 1 ))
+          then
+               app_fqdn=$app_name.$zonename
+               this_app_name="$app_name"
+          else
+               app_fqdn=$this_app_name.$zonename
+               this_app_name="$app_name"-"$this_location"
+          fi
+          # Download, modify and deploy manifest
           sample_filename=sample-kuard-ingress.yaml
           wget https://raw.githubusercontent.com/erjosito/deploy-aks/master/samples/kuard-ingress.yaml -O $sample_filename 2>/dev/null
-          app_fqdn=$this_app_name.$zonename
           sed -i "s|<host_fqdn>|${app_fqdn}|g" $sample_filename
           sed -i "s|<ingress_class>|${ingress_class}|g" $sample_filename
-          kubectl apply -f $sample_filename >/dev/null
-          if [ "$use_azure_dns" == "yes" ]
+          echo "Applying manifest $sample_filename to cluster $this_aksname for FQDN $app_fqdn..."
+          kubectl apply -f $sample_filename
+          # If >1 clusters no need to do DNS for the individual clusters, TM will do the name resolution
+          if [ "$use_azure_dns" == "yes" ] && [ "$number_of_clusters" == "1" ]
           then
                echo "Adding DNS name $app_fqdn for public IP $appgw_ip..."
                az network dns record-set a create -g $dnsrg -z $dnszone -n $this_app_name >/dev/null
@@ -1318,7 +1493,13 @@ do
           then
                if [ "$global_lb" == "tm" ]
                then
-                    az network traffic-manager endpoint create -n $this_app_name --profile-name $kuard_tm_dns -g $rg -t externalEndPoints --target $app_fqdn >/dev/null
+                    echo "Creating endpoint for $appgw_ip in Traffic Manager profile $kuard_tm_fqdn..."
+                    if [ "$tm_routing" == "Weighted" ]
+                    then
+                         az network traffic-manager endpoint create -n $this_location --profile-name $kuard_tm_dns -g $rg -t externalEndPoints --target $appgw_ip --weight 1 --custom-headers host=$app_fqdn >/dev/null
+                    else
+                         echo "Traffic Manager routing algorithm $tm_routing not supported by this script yet!"
+                    fi
                else
                     echo "AFD not implemented yet!!"
                fi
@@ -1340,7 +1521,8 @@ do
                sed -i "s|<ilb-subnet>|${akslb_subnet_name}|g" $sample_filename
                app_name=kuard-ilb
           fi
-          kubectl apply -f $sample_filename >/dev/null
+          echo "Applying manifest $sample_filename to cluster $this_aksname..."
+          kubectl apply -f $sample_filename
           # echo "${app_name} deployed, run 'kubectl config use-context $this_aksname && kubectl get svc' to find out its public IP"
           kuard_alb_ip=$(kubectl get svc/$app_name -o json | jq -rc '.status.loadBalancer.ingress[0].ip' 2>/dev/null)
           while [ "$kuard_alb_ip" == "null" ]
@@ -1359,7 +1541,7 @@ do
                az network firewall nat-rule create -n kuard-alb -f $this_azfw_name -g $rg --destination-addresses $azfw_ip --destination-ports 8080 --protocols Tcp --source-addresses '*' --translated-address $kuard_alb_ip --translated-port 8080 -c AKS-Services --priority 200 --action Dnat >/dev/null
                tm_endpoint_ip=$azfw_ip
           fi
-          # Traffic manager (or AFD, ToDo)
+          # Traffic manager (or AFD, in the future)
           if (( "$number_of_clusters" > 1 ))
           then
                if [ "$lb_type" == "external" ] || [ "$create_azfw" == "yes" ]
@@ -1367,7 +1549,12 @@ do
                     if [ "$global_lb" == "tm" ]
                     then
                          echo "Creating endpoint for $app_fqdn in Traffic Manager profile $aspnet_tm_fqdn..."
-                         az network traffic-manager endpoint create -n $app_name --profile-name $kuard_tm_dns -g $rg -t externalEndPoints --target $tm_endpoint_ip >/dev/null
+                         if [ "$tm_routing" == "Weighted" ]
+                         then
+                              az network traffic-manager endpoint create -n $app_name --profile-name $aspnet_tm_dns -g $rg -t externalEndPoints --target $tm_endpoint_ip --weight 1 --custom-headers host=$app_fqdn >/dev/null
+                         else
+                              echo "Traffic Manager routing algorithm $tm_routing not supported by this script yet!"
+                         fi
                     else
                          echo "AFD not implemented yet!!"
                     fi
@@ -1379,33 +1566,48 @@ do
      # sample aspnet app, port 80, ingress (there has to be an ingress controller)
      if [ "$create_appgw" == "yes" ] || [ "$enable_approuting_addon" == "yes" ]
      then
+          app_name=aspnet
+          # If we are routing with TM, the FQDN for each cluster should be the same
+          if (( "$number_of_clusters" > 1 ))
+          then
+               app_fqdn=$app_name.$zonename
+               this_app_name="$app_name"
+          else
+               app_fqdn=$this_app_name.$zonename
+               this_app_name="$app_name"-"$this_location"
+          fi
+          # Download, modify and deploy manifest
           sample_filename=sample-aspnet-ingress.yaml
           wget https://raw.githubusercontent.com/erjosito/deploy-aks/master/samples/aspnet-ingress.yaml -O $sample_filename 2>/dev/null 
-          app_name=aspnet
-          this_app_name="$app_name"-"$this_location"
-          app_fqdn=$this_app_name.$zonename
           sed -i "s|<host_fqdn>|${app_fqdn}|g" $sample_filename
           sed -i "s|<ingress_class>|${ingress_class}|g" $sample_filename
-          kubectl apply -f $sample_filename >/dev/null
-          if [ "$use_azure_dns" == "yes" ]
+          echo "Applying manifest $sample_filename to cluster $this_aksname..."
+          kubectl apply -f $sample_filename
+
+          # If >1 clusters no need to do DNS for the individual clusters, TM will do the name resolution
+          if [ "$use_azure_dns" == "yes" ] && [ "$number_of_clusters" == "1" ]
           then
                echo "Adding DNS name $app_fqdn for public IP $appgw_ip..."
-               az network dns record-set a create -g $dnsrg -z $dnszone -n $app_name >/dev/null
-               az network dns record-set a add-record -g $dnsrg -z $dnszone -n $app_name -a $appgw_ip >/dev/null
+               az network dns record-set a create -g $dnsrg -z $dnszone -n $this_app_name >/dev/null
+               az network dns record-set a add-record -g $dnsrg -z $dnszone -n $this_app_name -a $appgw_ip >/dev/null
           fi
-          echo "You can access the sample aspnet app on ${app_fqdn}"
-          # Traffic manager (or AFD, todo)
+          echo "You can access the sample app $this_app_name on ${app_fqdn}"
+          # Traffic manager
           if (( "$number_of_clusters" > 1 ))
           then
                if [ "$global_lb" == "tm" ]
                then
-                    echo "Creating endpoint for $app_fqdn in Traffic Manager profile $aspnet_tm_fqdn..."
-                    az network traffic-manager endpoint create -n $this_app_name --profile-name $aspnet_tm_dns -g $rg -t externalEndPoints --target $app_fqdn >/dev/null
+                    echo "Creating endpoint for $appgw_ip in Traffic Manager profile $aspnet_tm_fqdn..."
+                    if [ "$tm_routing" == "Weighted" ]
+                    then
+                         az network traffic-manager endpoint create -n $this_location --profile-name $aspnet_tm_dns -g $rg -t externalEndPoints --target $appgw_ip --weight 1 --custom-headers host=$app_fqdn >/dev/null
+                    else
+                         echo "Traffic Manager routing algorithm $tm_routing not supported by this script yet!"
+                    fi
                else
                     echo "AFD not implemented yet!!"
                fi
           fi
-     fi
 
      # pythonsql to verify access to the database over private link
      # PRIVATE REPO!! Move to dockerhub?
@@ -1438,7 +1640,7 @@ then
 fi
 
 # Calculate script run time
-script_run_time=$(expr `date +%s` - $start_time)
-((minutes=${script_run_time}%60))
-((seconds=${script_run_time}/60))
-echo "Total script run time was $minutes minutes and $seconds seconds"
+script_run_time=$(expr `date +%s` - $script_start_time)
+((minutes=${script_run_time}/60))
+((seconds=${script_run_time}%60))
+echo "Total script run time was $script_run_time seconds ($minutes minutes and $seconds seconds)"
