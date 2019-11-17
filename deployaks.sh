@@ -2,13 +2,9 @@
 
 ###############################################################
 # To Do:
-# - Azure Policy
-# - AzFw (ongoing)
-#   * enable logging to azmon ws (done)
-#   * KQL from cli -> not supported
-# - linkerd (ongoing)
-# - Traffic Manager (ongoing)
+# - Dev-spaces
 # - AFD as alternative to TM
+# - linkerd (ongoing)
 # - Storage & private link (the FQDN needs to be the same)
 # - Verify creating new AKV and new log analytics ws (ongoing)
 # - nginx ingress controller (ongoing)
@@ -21,7 +17,6 @@
 #   deployaks.sh --azfw --vm (AzFw->kuard, to test DNAT to kuard and correct egress filtering)
 #   deployaks.sh --nginx-ingress (nginx->kuard)
 #   deployaks.sh -l=northeurope,westeurope --azfw (TM->kuard)
-#   deployaks.sh -l=northeurope,westeurope --appgw (TM->AppGw->kuard)
 #   deployaks.sh -l=northeurope,westeurope --nginx-ingress (TM->nginx->kuard)
 #   deployaks.sh --linkerd
 #   deployaks.sh --db --db-location=westus2 (to test new code for private link)
@@ -29,6 +24,11 @@
 # - separate subnet for ALB frontend IPs
 # - AKS control plane ingress filtering
 # - AKS egres s filtering (with AzFW)
+# - Azure Policy
+# - AzFw
+#   * enable logging to azmon ws
+#   * KQL from cli -> not supported
+# - Traffic Manager
 ###############################################################
 
 # Take the start time to calculate total running time
@@ -101,6 +101,8 @@ max_retries=10
 # Format variables
 normal="\e[0m"
 underline="\e[4m"
+red="\e[31m"
+green="\e[32m"
 yellow="\e[33m"
 
 # Argument parsing (can overwrite the previously initialized variables)
@@ -668,20 +670,27 @@ do
      # Create APIM if required
      if [ "$create_apim" == "yes" ]
      then
-          # Deploy the premium sku if multiregion
-          # if (( "$number_of_clusters" > 1 ))
-          # then
-          #      apim_sku=Premium
-          # else
-          #      apim_sku=Developer
-          # fi
           apim_sku=Developer  # For the time being, do not use the multi-region feature of the Premium sku, since no way to add region with CLI
+          apim_vnet_type=External
+          apim_publisher_name=Jose      # Move this to the variables file
+          apim_publisher_email="jomore@microsoft.com"  # Move this to the variables file
           # Create subnet
           echo 'Creating subnet for Azure API Management...'
           az network vnet subnet create -g $rg -n $apim_subnet_name --vnet-name $this_vnet_name --address-prefix $apim_subnet_prefix >/dev/null
           # Create apim
           echo "Creating $apim_sku API Management..."
-          az apim create -n $this_apim_name -g $rg -l $this_location --sku-name $apim_sku >/dev/null
+          # CLI does not support at the time of this writing supplying the subnet ID
+          # az apim create -n $this_apim_name -g $rg -l $this_location --sku-name $apim_sku -v $apim_vnet_type >/dev/null
+          template_url=https://raw.githubusercontent.com/erjosito/deploy-aks/master/arm/apim.json
+          az group deployment create -n aksdeployment -g $monitor_rg --template-uri $template_url --parameters '{
+               "apiManagementServiceName": {"value": "'$this_apim_name'"},
+               "publisherName": {"value": "'$apim_publisher_name'"},
+               "publisherEmail": {"value": "'$apim_publisher_email'"},
+               "sku": {"value": "'$apim_sku'"},
+               "skuCount": {"value": 1},
+               "virtualNetworkName": {"value": "'$this_vnet_name'"},
+               "subnetName": {"value": "'$apim_subnet_name'"},
+               "location": {"value": "'$this_location'"}}' >/dev/null
      fi
 
      # Test VM
@@ -764,7 +773,10 @@ function WaitUntilFinished {
                exit
           fi
      else
-          echo "Resource $resource_name provisioning state is $state, wait time $(expr `date +%s` - $start_time) seconds"
+          run_time=$(expr `date +%s` - $start_time)
+          ((minutes=${run_time}/60))
+          ((seconds=${run_time}%60))
+          echo "Resource $resource_name provisioning state is $state, wait time $minutes minutes and $seconds seconds"
      fi
 }
 
@@ -1148,11 +1160,30 @@ do
           sed -i "s|<identityClientId>|${appgw_identity_clientid}|g" helm-config.yaml
           sed -i "s|<aks-api-server-address>|${master_ip}|g" helm-config.yaml
           sed -i "s|enabled: false|enabled: true|g" helm-config.yaml
+          agic_chart_name=agic
           if [ "$helm_version" == "2" ]
           then
-               $helm_exec install -f helm-config.yaml application-gateway-kubernetes-ingress/ingress-azure >/dev/null
+               $helm_exec install -f helm-config.yaml application-gateway-kubernetes-ingress/ingress-azure -n $agic_chart_name >/dev/null
+               retry_count=0
+               until [ $(helm2 list --output json | jq -rc '.Releases[] | select(.Name == "'$agic_chart_name'") | .Status') == "DEPLOYED" ]
+               do
+                    if (( $retry_count > $max_retries ))
+                    then
+                         "Maximum retries, AGIC chart not ready, something went wrong..."
+                         if [[ "${BASH_SOURCE[0]}" != "${0}" ]]
+                         then
+                              return
+                         else
+                              exit
+                         fi
+                    fi
+                    echo "AGIC chart not ready. Waiting $wait_interval..."
+                    sleep $wait_interval
+                    retry_count=$(( $retry_count + 1 ))
+               done
+               echo -e "AGIC chart status is ${green}DEPLOYED${normal}"
           else
-               $helm_exec install agic -f helm-config.yaml application-gateway-kubernetes-ingress/ingress-azure >/dev/null
+               $helm_exec install $agic_chart_name -f helm-config.yaml application-gateway-kubernetes-ingress/ingress-azure >/dev/null
           fi
      fi
 
@@ -1364,7 +1395,7 @@ then
                kuard_tm_dns="$app_name""$RANDOM"
                kuard_tm_fqdn="$kuard_tm_dns".trafficmanager.net
                az network traffic-manager profile create -n $kuard_tm_dns -g $rg --routing-method $tm_routing --unique-dns-name $kuard_tm_dns >/dev/null
-               echo "Created Traffic Manager profile on ${yellow}${kuard_tm_fqdn}${normal} with routing type $tm_routing"
+               echo -e "Created Traffic Manager profile on ${yellow}${kuard_tm_fqdn}${normal} with routing type $tm_routing"
                if [ "$use_azure_dns" == "yes" ]
                then
                     echo "Adding DNS CNAME $app_name in zone $dnszone for FQDN $kuard_tm_fqdn..."
@@ -1383,7 +1414,7 @@ then
                aspnet_tm_dns="$app_name""$RANDOM"
                aspnet_tm_fqdn="$aspnet_tm_dns".trafficmanager.net
                az network traffic-manager profile create -n $aspnet_tm_dns -g $rg --routing-method $tm_routing --unique-dns-name $aspnet_tm_dns >/dev/null
-               echo "Created Traffic Manager profile on ${yellow}${aspnet_tm_fqdn}${normal} with routing type $tm_routing"
+               echo -e "Created Traffic Manager profile on ${yellow}${aspnet_tm_fqdn}${normal} with routing type $tm_routing"
                if [ "$use_azure_dns" == "yes" ]
                then
                     echo "Adding DNS CNAME $app_name in zone $dnszone for FQDN $aspnet_tm_fqdn..."
@@ -1435,7 +1466,7 @@ do
                     # What if the nginx controller is frontended by a firewall? The IP address should be that of the AzFw...
                     if [ "$create_azfw" == "yes" ]
                     then
-                         ingress_ip=$(az network public-ip show -g $rg -n $this_appgw_pipname --query ipAddress -o tsv 2>/dev/null)
+                         ingress_ip=$(az network public-ip show -g $rg -n $this_azfw_pipname --query ipAddress -o tsv 2>/dev/null)
                          echo "Region $this_location seems to be configured with an Azure Firewall in front of ngnix, with publi IP $ingress_ip"
                     else
                          nginx_ingress_svc_name=ingress-nginx-ingress-controller
@@ -1493,10 +1524,10 @@ do
           then
                if [ "$global_lb" == "tm" ]
                then
-                    echo "Creating endpoint for $appgw_ip in Traffic Manager profile $kuard_tm_fqdn..."
+                    echo "Creating endpoint for $ingress_ip in Traffic Manager profile $kuard_tm_fqdn..."
                     if [ "$tm_routing" == "Weighted" ]
                     then
-                         az network traffic-manager endpoint create -n $this_location --profile-name $kuard_tm_dns -g $rg -t externalEndPoints --target $appgw_ip --weight 1 --custom-headers host=$app_fqdn >/dev/null
+                         az network traffic-manager endpoint create -n $this_location --profile-name $kuard_tm_dns -g $rg -t externalEndPoints --target $ingress_ip --weight 1 --custom-headers host=$app_fqdn >/dev/null
                     else
                          echo "Traffic Manager routing algorithm $tm_routing not supported by this script yet!"
                     fi
@@ -1551,7 +1582,7 @@ do
                          echo "Creating endpoint for $app_fqdn in Traffic Manager profile $aspnet_tm_fqdn..."
                          if [ "$tm_routing" == "Weighted" ]
                          then
-                              az network traffic-manager endpoint create -n $app_name --profile-name $aspnet_tm_dns -g $rg -t externalEndPoints --target $tm_endpoint_ip --weight 1 --custom-headers host=$app_fqdn >/dev/null
+                              az network traffic-manager endpoint create -n $this_location --profile-name $aspnet_tm_dns -g $rg -t externalEndPoints --target $tm_endpoint_ip --weight 1 >/dev/null
                          else
                               echo "Traffic Manager routing algorithm $tm_routing not supported by this script yet!"
                          fi
@@ -1597,10 +1628,10 @@ do
           then
                if [ "$global_lb" == "tm" ]
                then
-                    echo "Creating endpoint for $appgw_ip in Traffic Manager profile $aspnet_tm_fqdn..."
+                    echo "Creating endpoint for $ingress_ip in Traffic Manager profile $aspnet_tm_fqdn..."
                     if [ "$tm_routing" == "Weighted" ]
                     then
-                         az network traffic-manager endpoint create -n $this_location --profile-name $aspnet_tm_dns -g $rg -t externalEndPoints --target $appgw_ip --weight 1 --custom-headers host=$app_fqdn >/dev/null
+                         az network traffic-manager endpoint create -n $this_location --profile-name $aspnet_tm_dns -g $rg -t externalEndPoints --target $ingress_ip --weight 1 --custom-headers host=$app_fqdn >/dev/null
                     else
                          echo "Traffic Manager routing algorithm $tm_routing not supported by this script yet!"
                     fi
@@ -1608,6 +1639,7 @@ do
                     echo "AFD not implemented yet!!"
                fi
           fi
+     fi
 
      # pythonsql to verify access to the database over private link
      # PRIVATE REPO!! Move to dockerhub?
@@ -1635,7 +1667,7 @@ then
           this_vm_pip_name="$this_vm_name"-pip
           this_vm_pip_ip=$(az network public-ip show -g $rg -n $this_vm_pip_name --query ipAddress -o tsv)
           # No user required, since uisng publich SSH key auth
-          echo "  ssh "$this_vm_pip_ip""
+          echo -e "  ${green}ssh "$this_vm_pip_ip"${normal}"
      done
 fi
 
@@ -1643,4 +1675,4 @@ fi
 script_run_time=$(expr `date +%s` - $script_start_time)
 ((minutes=${script_run_time}/60))
 ((seconds=${script_run_time}%60))
-echo "Total script run time was $script_run_time seconds ($minutes minutes and $seconds seconds)"
+echo "Total script run time was $minutes minutes and $seconds seconds"
