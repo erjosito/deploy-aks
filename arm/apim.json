@@ -48,6 +48,13 @@
         "description": "Virtual Network name"
       }
     },
+    "virtualNetworkType": {
+      "type": "string",
+      "allowedValues": ["External", "Internal", "None"],
+      "metadata": {
+        "description": "Virtual Network type"
+      }
+    },
     "subnetName": {
       "type": "string",
       "metadata": {
@@ -79,7 +86,7 @@
       "properties": {
         "publisherEmail": "[parameters('publisherEmail')]",
         "publisherName": "[parameters('publisherName')]",
-        "virtualNetworkType": "Internal",
+        "virtualNetworkType": "[parameters('virtualNetworkType')]",
         "virtualNetworkConfiguration": {
           "subnetResourceId": "[variables('subnetRef')]"
         }
