@@ -1,0 +1,126 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2015-01-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "apiManagementServiceName": {
+          "type": "string",
+          "defaultValue": "MyAPIManagementInstance"
+        },
+        "productName": {
+          "type": "string",
+          "defaultValue": "contosoproduct"
+        },
+        "userGroupName": {
+          "type": "string",
+          "defaultValue": "contosogroup"
+        },
+        "userFirstName": {
+          "type": "string",
+          "defaultValue": "John"
+        },
+        "userLastName": {
+          "type": "string",
+          "defaultValue": "Smith"
+        },
+        "userEmail": {
+          "type": "string",
+          "defaultValue": "john.smith@contoso.com"
+        }
+    },
+    "variables": {
+        "userName": "[concat(parameters('userFirstName'), '-', parameters('userLastName'))]"
+    },
+    "resources": [
+        {
+            "type": "Microsoft.ApiManagement/service/users",
+            "name": "[concat(parameters('apiManagementServiceName'), '/', variables('userName'))]",
+            "apiVersion": "2017-03-01",
+            "scale": null,
+            "properties": {
+                "firstName": "[parameters('userFirstName')]",
+                "lastName": "[parameters('userLastName')]",
+                "email": "[parameters('userEmail')]",
+                "state": "active",
+                "note": "Developer consuming our APIs",
+                "confirmation": "invite"
+            },
+            "dependsOn": []
+        },
+        {
+            "type": "Microsoft.ApiManagement/service/groups",
+            "name": "[concat(parameters('apiManagementServiceName'), '/', parameters('userGroupName'))]",
+            "apiVersion": "2017-03-01",
+            "scale": null,
+            "properties": {
+                "displayName": "[parameters('userGroupName')]",
+                "description": "Group containing all developers and services who will be consuming our APIs",
+                "type": "custom",
+                "externalId": null
+            },
+            "dependsOn": []
+        },
+        {
+            "type": "Microsoft.ApiManagement/service/groups/users",
+            "name": "[concat(parameters('apiManagementServiceName'), '/', parameters('userGroupName'), '/', variables('userName'))]",
+            "apiVersion": "2017-03-01",
+            "scale": null,
+            "properties": {},
+            "dependsOn": [
+                "[resourceId('Microsoft.ApiManagement/service/groups', parameters('apiManagementServiceName'), parameters('userGroupName'))]"
+            ]
+        },
+        {
+            "type": "Microsoft.ApiManagement/service/products",
+            "name": "[concat(parameters('apiManagementServiceName'), '/', parameters('productName'))]",
+            "apiVersion": "2017-03-01",
+            "scale": null,
+            "properties": {
+                "displayName": "[parameters('productName')]",
+                "description": "Product which will apply the high-over policies for developers and services",
+                "subscriptionRequired": true,
+                "approvalRequired": true,
+                "state": "published"
+            },
+            "dependsOn": []
+        },
+        {
+            "type": "Microsoft.ApiManagement/service/products/groups",
+            "name": "[concat(parameters('apiManagementServiceName'), '/', parameters('productName'), '/', parameters('userGroupName'))]",
+            "apiVersion": "2017-03-01",
+            "scale": null,
+            "properties": {},
+            "dependsOn": [
+                "[resourceId('Microsoft.ApiManagement/service/products', parameters('apiManagementServiceName'), parameters('productName'))]",
+                "[resourceId('Microsoft.ApiManagement/service/groups', parameters('apiManagementServiceName'), parameters('userGroupName'))]"
+            ]
+        },
+        {
+            "type": "Microsoft.ApiManagement/service/subscriptions",
+            "name": "[concat(parameters('apiManagementServiceName'), '/5ae6ed2358c2795ab5aaba68')]",
+            "apiVersion": "2017-03-01",
+            "scale": null,
+            "properties": {
+                "userId": "[resourceId('Microsoft.ApiManagement/service/users', parameters('apiManagementServiceName'), variables('userName'))]",
+                "productId": "[resourceId('Microsoft.ApiManagement/service/products', parameters('apiManagementServiceName'), parameters('productName'))]",
+                "displayName": "[concat('Subscription for product ', parameters('productName'))]",
+                "state": "active"
+            },
+            "dependsOn": [
+                "[resourceId('Microsoft.ApiManagement/service/users', parameters('apiManagementServiceName'), variables('userName'))]",
+                "[resourceId('Microsoft.ApiManagement/service/products', parameters('apiManagementServiceName'), parameters('productName'))]"
+            ]
+        },
+        {
+            "type": "Microsoft.ApiManagement/service/products/policies",
+            "name": "[concat(parameters('apiManagementServiceName'), '/', parameters('productName'), '/policy')]",
+            "apiVersion": "2017-03-01",
+            "scale": null,
+            "properties": {
+                "policyContent": "<policies>\r\n  <inbound>\r\n    <base />\r\n    <rate-limit calls=\"20\" renewal-period=\"60\" />\r\n  </inbound>\r\n  <backend>\r\n    <base />\r\n  </backend>\r\n  <outbound>\r\n    <base />\r\n  </outbound>\r\n  <on-error>\r\n    <base />\r\n  </on-error>\r\n</policies>"
+            },
+            "dependsOn": [
+                "[resourceId('Microsoft.ApiManagement/service/products', parameters('apiManagementServiceName'), parameters('productName'))]"
+            ]
+        }
+    ]
+}

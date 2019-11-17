@@ -585,6 +585,7 @@ do
      this_appgw_pipname="$appgw_pipname"-"$this_location"
      this_azfw_name="$azfw_name"-"$this_location"
      this_azfw_pipname="$azfw_pipname"-"$this_location"
+     this_apim_name="$apim_name"-"$this_location"
 
      # Subnet
      echo "Creating subnet for AKS cluster in $this_location..."
@@ -672,25 +673,61 @@ do
      then
           apim_sku=Developer  # For the time being, do not use the multi-region feature of the Premium sku, since no way to add region with CLI
           apim_vnet_type=External
-          apim_publisher_name=Jose      # Move this to the variables file
-          apim_publisher_email="jomore@microsoft.com"  # Move this to the variables file
           # Create subnet
           echo 'Creating subnet for Azure API Management...'
           az network vnet subnet create -g $rg -n $apim_subnet_name --vnet-name $this_vnet_name --address-prefix $apim_subnet_prefix >/dev/null
-          # Create apim
+          # Create apim service - THIS TAKES QUITE A WHILE: CHANGE to ASYNC!
           echo "Creating $apim_sku API Management..."
           # CLI does not support at the time of this writing supplying the subnet ID
           # az apim create -n $this_apim_name -g $rg -l $this_location --sku-name $apim_sku -v $apim_vnet_type >/dev/null
           template_url=https://raw.githubusercontent.com/erjosito/deploy-aks/master/arm/apim.json
-          az group deployment create -n aksdeployment -g $monitor_rg --template-uri $template_url --parameters '{
+          deployment_name="apim"$this_location
+          az group deployment create -n $deployment_name -g $rg --template-uri $template_url --parameters '{
                "apiManagementServiceName": {"value": "'$this_apim_name'"},
                "publisherName": {"value": "'$apim_publisher_name'"},
                "publisherEmail": {"value": "'$apim_publisher_email'"},
                "sku": {"value": "'$apim_sku'"},
                "skuCount": {"value": 1},
+               "virtualNetworkType": {"value": "'$apim_vnet_type'"},
                "virtualNetworkName": {"value": "'$this_vnet_name'"},
                "subnetName": {"value": "'$apim_subnet_name'"},
                "location": {"value": "'$this_location'"}}' >/dev/null
+          # Get service principal ID for MSI (required to enable read access to the AKV for the https certificate)
+          apim_principal_id=$(az apim show -n $this_apim_name -g $rg --query identity.principalId -o tsv 2>/dev/null)
+          apim_public_ip=$(az apim show -n $this_apim_name -g $rg --query publicIpAddresses[0] -o tsv 2>/dev/null)
+          # Add user groups, users, product and subscription
+          template_url=https://raw.githubusercontent.com/erjosito/deploy-aks/master/arm/apim-user.json
+          deployment_name="apimuser"$this_location
+          apim_product_name=kuard
+          apim_user_group_name=contosogroup
+          apim_user_first_name=Jose
+          apim_user_last_name=Moreno
+          apim_user_email="erjosito@hotmail.com"
+          az group deployment create -n $deployment_name -g $rg --template-uri $template_url --parameters '{
+               "apiManagementServiceName": {"value": "'$this_apim_name'"},
+               "productName": {"value": "'$apim_product_name'"},
+               "userGroupName": {"value": "'$apim_user_group_name'"},
+               "userFirstName": {"value": "'$apim_user_first_name'"},
+               "userLastName": {"value": "'$apim_user_last_name'"},
+               "userEmail": {"value": "'$apim_user_email'"}}' >/dev/null
+          # Add API to product group
+          template_url=https://raw.githubusercontent.com/erjosito/deploy-aks/master/arm/apim-api.json
+          deployment_name="apimapi"$this_location
+          apim_api_name=kuard
+          apim_api_url="https://myapi.com"
+          apim_api_path=""
+          apim_op_name="GETexample"
+          apim_op_method="GET"
+          apim_op_policy=""
+          az group deployment create -n $deployment_name -g $rg --template-uri $template_url --parameters '{
+               "apiManagementServiceName": {"value": "'$this_apim_name'"},
+               "productName": {"value": "'$apim_product_name'"},
+               "apiName": {"value": "'$apim_api_name'"},
+               "apiUrl": {"value": "'$apim_api_url'"},
+               "apiPath": {"value": "'$apim_api_path'"},
+               "operationName": {"value": "'$apim_op_name'"},
+               "operationMethod": {"value": "'$apim_op_method'"},
+               "operationPolicy": {"value": "'$apim_op_policy'"}}' >/dev/null
      fi
 
      # Test VM
@@ -748,6 +785,39 @@ then
      echo "Creating example secret in keyvault $flexvol_kv_name with value $flexvol_secret_value..."
      az keyvault secret set -n $flexvol_secret_name --value $flexvol_secret_value --vault-name $flexvol_kv_name >/dev/null
 fi
+
+# Function to wait until a resource is provisioned:
+# Arguments:
+# - RG
+# - deployment name
+function WaitUntilArmFinished {
+     arm_deployment_rg=$1
+     arm_deployment_name=$2
+     echo "Waiting for ARM deployment $arm_deploymnet_name in resource group $arm_deploymnet_rg to finish provisioning..."
+     start_time=`date +%s`
+     state=$(az group deployment show -n $arm_deployment_name -g $arm_deployment_rg --query properties.provisioningState -o tsv 2>/dev/null)
+     until [ "$state" == "Succeeded" ] || [ "$state" == "Failed" ] || [ -z "$state" ]
+     do
+          sleep $wait_interval
+          state=$(az group deployment show -n $arm_deployment_name -g $arm_deployment_rg --query properties.provisioningState -o tsv 2>/dev/null)
+     done
+     if [ -z "$state" ]
+     then
+          echo "Something happened, could not find out the provisioning state of deployment $arm_deployment_name in resource group $arm_deployment_rg..."
+          if [[ "${BASH_SOURCE[0]}" != "${0}" ]]
+          then
+               return
+          else
+               exit
+          fi
+     else
+          run_time=$(expr `date +%s` - $start_time)
+          ((minutes=${run_time}/60))
+          ((seconds=${run_time}%60))
+          echo "Resource $resource_name provisioning state is $state, wait time $minutes minutes and $seconds seconds"
+     fi
+}
+
 
 # Function to wait until a resource is provisioned:
 # Arguments:
@@ -1509,6 +1579,7 @@ do
           wget https://raw.githubusercontent.com/erjosito/deploy-aks/master/samples/kuard-ingress.yaml -O $sample_filename 2>/dev/null
           sed -i "s|<host_fqdn>|${app_fqdn}|g" $sample_filename
           sed -i "s|<ingress_class>|${ingress_class}|g" $sample_filename
+          sed -i "s|<private_ip>|false|g" $sample_filename
           echo "Applying manifest $sample_filename to cluster $this_aksname for FQDN $app_fqdn..."
           kubectl apply -f $sample_filename
           # If >1 clusters no need to do DNS for the individual clusters, TM will do the name resolution

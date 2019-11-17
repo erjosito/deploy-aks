@@ -59,6 +59,11 @@ appgw_identity_name=appgwid
 # Azure Firewall
 azfw_name=azfw
 azfw_pipname=azfw-pip
+# Azure API Management
+apim_name=aksapim
+apim_subnet_name=apim
+apim_publisher_name=John
+apim_publisher_email="john.doe@contoso.com"
 # Database
 db_type=azuresql
 db_server_name=myaksdbserver$RANDOM

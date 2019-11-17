@@ -1,0 +1,89 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2015-01-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "apiManagementServiceName": {
+          "type": "string",
+          "defaultValue": "MyAPIManagementInstance"
+        },
+        "productName": {
+          "type": "string",
+          "defaultValue": "exampleProduct"
+        },
+        "apiName": {
+          "type": "string",
+          "defaultValue": "exampleApi"
+        },
+        "apiUrl": {
+          "type": "string",
+          "defaultValue": "https://example.net"
+        },
+        "apiPath": {
+          "type": "string",
+          "defaultValue": "exampleapipath"
+        },
+        "operationName": {
+          "type": "string",
+          "defaultValue": "exampleOperationsGET"
+        },
+        "operationMethod": {
+          "type": "string",
+          "defaultValue": "GET"
+        },
+        "operationPolicy": {
+          "type": "string",
+          "defaultValue": ""
+        }
+    },
+    "variables": {
+        "apim_api_version": "2019-01-01"
+    },
+    "resources": [
+         {
+            "apiVersion": "[variables('apim_api_version')]",
+            "type": "Microsoft.ApiManagement/service/apis",
+            "name": "[concat(parameters('apiManagementServiceName'), '/', parameters('apiName'))]",
+            "dependsOn": [],
+            "properties": {
+                "displayName": "[concat(parameters('apiName'), ' API')]",
+                "description": "Description for example API",
+                "apiUrl": "[parameters('apiUrl')]",
+                "path": "[parameters('apiPath')]",
+                "protocols": [
+                    "HTTP",
+                    "HTTPS"
+                ]
+            }
+        },
+        {
+            "apiVersion": "[variables('apim_api_version')]",
+            "type": "Microsoft.ApiManagement/service/apis/operations",
+            "name": "[concat(parameters('apiManagementServiceName'), '/', parameters('apiName'), '/', parameters('operationName'))]",
+            "dependsOn": [
+                "[resourceId('Microsoft.ApiManagement/service/apis', parameters('apiManagementServiceName'), parameters('apiName'))]"
+            ],
+            "properties": {
+                "displayName": "[parameters('operationMethod')]",
+                "description": "[concat('A demonstration of a ', parameters('operationMethod'), ' call')]",
+                "method": "[parameters('operationMethod')]",
+                "urlTemplate": "/",
+                "request": {
+                    "queryParameters": [],
+                    "headers": [],
+                    "representations": []
+                }
+            }
+        },
+        {
+            "apiVersion": "[variables('apim_api_version')]",
+            "type": "Microsoft.ApiManagement/service/apis/operations/policies",
+            "name": "[concat(parameters('apiManagementServiceName'), '/', parameters('apiName'), '/', parameters('operationName'), '/policy')]",
+            "dependsOn": [
+                "[resourceId('Microsoft.ApiManagement/service/apis/operations', parameters('apiManagementServiceName'), parameters('apiName'), parameters('operationName'))]"
+            ],
+            "properties": {
+                "policyContent": "[parameters('operationPolicy')]"
+            }
+        }
+    ]
+}

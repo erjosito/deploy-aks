@@ -90,6 +90,9 @@
         "virtualNetworkConfiguration": {
           "subnetResourceId": "[variables('subnetRef')]"
         }
+      },
+      "identity": {
+        "type": "SystemAssigned"
       }
     }
   ]
