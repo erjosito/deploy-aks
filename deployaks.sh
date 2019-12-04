@@ -6,12 +6,14 @@
 # - AFD as alternative to TM
 # - linkerd (ongoing)
 # - Storage & private link (the FQDN needs to be the same)
+# - Service endpoints?
 # - Verify creating new AKV and new log analytics ws (ongoing)
 # - nginx ingress controller (ongoing)
 #   * with private IP
 # - cert management:
 #   * nginx ingress controller
 #   * AGIC     
+# - Prometheus
 # - APIM
 # - Add private IP frontend to the app gateway
 # To test (note that running two tests at the same time might cause conflicts with kubectl contexts):
@@ -132,6 +134,7 @@ deploy_ca=no
 azure_policy=no
 attach_acr=yes
 helm_version=2
+prometheus=no
 min_node_count=1
 max_node_count=3
 max_retries=10
@@ -181,6 +184,10 @@ do
                ;;
           -w|--windows)
                windows=yes
+               shift # past argument with no value
+               ;;
+          --prometheus)
+               prometheus=yes
                shift # past argument with no value
                ;;
           --vm)
@@ -434,10 +441,22 @@ else
      echo "Assigning permissions to new service principal..."
      rgid=$(az group show -n $rg -o tsv --query id)
      echo "Assigning permissions to new app ID $appid..."
+     retry_count=0
      until az role assignment create --assignee $appid --scope $rgid --role Contributor
      do
+          if [[ $retry_count -gt $max_retries ]]
+          then
+               "Maximum retries, something went wrong..."
+               if [[ $script_sourced == "yes" ]]
+               then
+                    return
+               else
+                    exit
+               fi
+          fi
           echo "There has been an error. Retrying in $wait_interval"
           sleep $wait_interval
+          retry_count=$(( $retry_count + 1 ))
      done
      # Get SSH public key
      sshpublickey_filename='~/.ssh/id_rsa.pub'
@@ -584,14 +603,6 @@ else
      ca_options=""
 fi
 
-# Define cluster-autoscaler options
-if [[ "$attach_acr" == "yes" ]]
-then
-     acr_options="--attach-acr $acr_id"
-else
-     acr_options=""
-fi
-
 # Override some values that are not supported by kubenet
 if [[ "$network_plugin" == "kubenet" ]]
 then
@@ -646,7 +657,7 @@ do
                --network-plugin $network_plugin --vnet-subnet-id $subnetid --service-cidr $aks_service_cidr \
                --enable-addons monitoring --workspace-resource-id $wsid \
                --network-policy "$nw_policy" \
-               ${(z)vmss_options} ${(z)windows_options} ${(z)ca_options} ${(z)acr_options} \
+               ${(z)vmss_options} ${(z)windows_options} ${(z)ca_options} \
                --load-balancer-sku $lb_sku \
                --node-resource-group "$this_aksname"-iaas-"$RANDOM" \
                --tags "$tag1_name"="$tag1_value" \
@@ -658,7 +669,7 @@ do
                --admin-username $adminuser --ssh-key-value "$sshpublickey" \
                --network-plugin $network_plugin --vnet-subnet-id $subnetid --service-cidr $aks_service_cidr \
                --enable-addons monitoring --workspace-resource-id $wsid \
-               --network-policy "$nw_policy" $vmss_options $windows_options $ca_options $acr_options \
+               --network-policy "$nw_policy" $vmss_options $windows_options $ca_options \
                --load-balancer-sku $lb_sku \
                --node-resource-group "$this_aksname"-iaas-"$RANDOM" \
                --tags "$tag1_name"="$tag1_value" \
@@ -712,7 +723,7 @@ do
           echo "Azure Firewall $azfw_id created with public IP $azfw_ip and private IP $azfw_private_ip"
           # Rules
           echo "Adding network rules in Azure Firewall $this_azfw_name..."
-          az network firewall network-rule create -f $this_azfw_name -g $rg -c VM-to-AKS --protocols Any --destination-addresses $aks_subnet_prefix --destination-ports '*' --source-addresses $vm_subnet_prefix -n Allow-VM-to-AKS --priority 210 --action Allow >/dev/null
+          az network firewall network-rule create -f $this_azfw_name -g $rg -c VnetTraffic --protocols Any --destination-addresses $vnetprefix --destination-ports '*' --source-addresses $vnetprefix -n Allow-VM-to-AKS --priority 210 --action Allow >/dev/null
           az network firewall network-rule create -f $this_azfw_name -g $rg -c WebTraffic --protocols Tcp --destination-addresses $azfw_ip --destination-ports 80 8080 443 --source-addresses '*' -n AllowWeb --priority 300 --action Allow >/dev/null
           az network firewall network-rule create -f $this_azfw_name -g $rg -c AKS-egress --protocols Udp --destination-addresses '*' --destination-ports 123 --source-addresses $aks_subnet_prefix -n NTP --priority 220 --action Allow >/dev/null
           # Eventually use dest addresses for NTP: 91.189.89.198, 91.189.89.199, 91.189.91.157, 91.189.94.4 (but this is risky if addresses change)
@@ -720,12 +731,21 @@ do
           az network firewall application-rule create -f $this_azfw_name -g $rg -c Helper-tools --protocols Http=80 Https=443 --target-fqdns ifconfig.co --source-addresses $vnetprefix -n Allow-ifconfig --priority 200 --action Allow >/dev/null
           # Application rule: AKS-egress (https://docs.microsoft.com/en-us/azure/aks/limit-egress-traffic):
           # Creating rules takes a long time, hence it is better creating one with many FQDNs, than one per FQDN
-          target_fqdns="*.azmk8s.io aksrepos.azurecr.io *.blob.core.windows.net mcr.microsoft.com *.cdn.mscr.io management.azure.com login.microsoftonline.com packages.azure.com acs-mirror.azureedge.net *.oms.opinsights.azure.com $acr_url gcr.io storage.googleapis.com dc.services.visualstudio.com"
+          rule-name="Egress"
+          target_fqdns="*.azmk8s.io aksrepos.azurecr.io *.blob.core.windows.net mcr.microsoft.com *.cdn.mscr.io management.azure.com login.microsoftonline.com packages.azure.com acs-mirror.azureedge.net *.opinsights.azure.com *.monitoring.azure.com dc.services.visualstudio.com"
           if [[ $SHELL == *"zsh"* ]]  # If zsh we need to expand the variables with (z)
           then
-               az network firewall application-rule create -f $this_azfw_name -g $rg -c AKS-egress --protocols Https=443 --target-fqdns "${(z)target_fqdns}" --source-addresses $aks_subnet_prefix -n AKSegress --priority 220 --action Allow >/dev/null
+               az network firewall application-rule create -f $this_azfw_name -g $rg -c AKS-egress --protocols Https=443 --target-fqdns "${(z)target_fqdns}" --source-addresses $aks_subnet_prefix -n $rule_name --priority 220 --action Allow >/dev/null
           else
-               az network firewall application-rule create -f $this_azfw_name -g $rg -c AKS-egress --protocols Https=443 --target-fqdns "$target_fqdns" --source-addresses $aks_subnet_prefix -n AKSegress --priority 220 --action Allow >/dev/null
+               az network firewall application-rule create -f $this_azfw_name -g $rg -c AKS-egress --protocols Https=443 --target-fqdns "$target_fqdns" --source-addresses $aks_subnet_prefix -n $rule_name --priority 220 --action Allow >/dev/null
+          fi
+          rule-name="Registries"
+          target_fqdns="$acr_url *.gcr.io storage.googleapis.com *.docker.io quay.io *.cloudfront.net production.cloudflare.docker.com"
+          if [[ $SHELL == *"zsh"* ]]  # If zsh we need to expand the variables with (z)
+          then
+               az network firewall application-rule create -f $this_azfw_name -g $rg -c AKS-egress --protocols Https=443 --target-fqdns "${(z)target_fqdns}" --source-addresses $aks_subnet_prefix -n $rule_name >/dev/null
+          else
+               az network firewall application-rule create -f $this_azfw_name -g $rg -c AKS-egress --protocols Https=443 --target-fqdns "$target_fqdns" --source-addresses $aks_subnet_prefix -n $rule_name >/dev/null
           fi
      fi
 
@@ -833,11 +853,11 @@ do
 done
 
 # Create a key vault in the RG for the apps in the AKS cluster
-if [[ "flexvol" == "yes" ]]
+if [[ "$flexvol" == "yes" ]]
 then
      # AKV and secret
      echo "Creating AKV in resource group $rg"
-     flexvol_kv_name=flexvol$RANDOM
+     flexvol_kv_name="flexvol${RANDOM}"
      az keyvault create -n $flexvol_kv_name -g $rg -l $rg_location >/dev/null
      flexvol_kv_id=$(az keyvault show -n $flexvol_kv_name -g $rg -o tsv --query id) 2>/dev/null
      echo "Key Vault $flexvol_kv_id created"
@@ -967,6 +987,13 @@ do
           kubectl apply -f https://raw.githubusercontent.com/erjosito/deploy-aks/master/samples/privileged.yaml
      fi
 
+     # Attach ACR
+     if [[ "$attach_acr" == "yes" ]]
+     then
+          echo "Attaching ACR ${acr_id}"
+          az aks update -n $this_aksname -g $rg  "--attach-acr ${acr_id}"
+     fi
+
      # Configure logging for the master nodes
      echo "Enabling logging for AKS master nodes in $this_aksname to log to analytics workspace $monitor_ws..."
      aks_id=$(az aks show -n $this_aksname -g $rg -o tsv --query id 2>/dev/null)
@@ -1016,6 +1043,16 @@ do
           # Check
           echo "Configured the following authorized IP ranges: "
           az aks show -n $this_aksname -g $rg -o tsv --query apiServerAccessProfile.authorizedIpRanges
+     fi
+
+     if [[ ${prometheus} == "yes" ]]
+     then
+          
+          prom_url=https://github.com/prometheus/prometheus/releases/download/v2.14.0/prometheus-2.14.0.darwin-amd64.tar.gz
+          wget https://github.com/prometheus/prometheus/releases/download/v2.14.0/prometheus-2.14.0.darwin-amd64.tar.gz -q -O prometheus.tar.gzwg
+          tar xvfz ./prometheus.tar.gz
+          cd $(find ./ -type d -name "prometheus*")
+
      fi
 
      # Extra node pool
@@ -1182,10 +1219,22 @@ do
           # Contributor role on app gw
           role_name=Contributor
           echo "Adding role $role_name for identity $this_appgw_identity_name ($appgw_identity_principalid) to $this_apgw_name ($appgw_id)..."
+          retry_count=0
           until az role assignment create --role $role_name --assignee $appgw_identity_principalid --scope $appgw_id >/dev/null
           do
+               if [[ $retry_count -gt $max_retries ]]
+               then
+                    "Maximum retries reached, something went wrong..."
+                    if [[ $script_sourced == "yes" ]]
+                    then
+                         return
+                    else
+                         exit
+                    fi
+               fi
                echo "There has been an error assigning the role. Retrying in $wait_interval"
                sleep $wait_interval
+               retry_count=$(( $retry_count + 1 ))
           done
           assigned_role=$(az role assignment list --scope $appgw_id -o tsv --query "[?principalId=='$appgw_identity_principalid'].roleDefinitionName")
           if [[ "$assigned_role" == "$role_name" ]]
@@ -1398,10 +1447,22 @@ do
           flexvol_id_principalid=$(az identity show -g $rg -n $this_flexvol_id_name --query principalId -o tsv 2>/dev/null)
           echo "Assigning Reader permissions for the new identity $this_flexvol_id_name (principal IP $flexvol_id_principalid) on the Azure KeyVault $flexvol_kv_id..."
           role_name=Reader
+          retry_count=0
           until az role assignment create --role $role_name --assignee $flexvol_id_principalid --scope $flexvol_kv_id >/dev/null
           do
+               if [[ $retry_count -gt $max_retries ]]
+               then
+                    "Maximum retries reached, something went wrong..."
+                    if [[ $script_sourced == "yes" ]]
+                    then
+                         return
+                    else
+                         exit
+                    fi
+               fi
                echo "There has been an error. Retrying in $wait_interval"
                sleep $wait_interval
+               retry_count=$(( $retry_count + 1 ))
           done
           # Verify
           assigned_role=$(az role assignment list --scope $flexvol_kv_id -o tsv --query "[?principalId=='$flexvol_id_principalid'].roleDefinitionName" 2>/dev/null)
@@ -1432,7 +1493,7 @@ do
           sed -i "s|<label>|${flexvol_label}|g" $dst_file_name
           kubectl apply -f $dst_file_name >/dev/null
           # Test pod and verify access to secret
-          echo "Deploying test pod..."
+          echo "Deploying AKV flexvol test pod..."
           flexvol_pod_name=kvtest
           src_file_url=https://raw.githubusercontent.com/erjosito/deploy-aks/master/samples/flexvol-test.yaml
           dst_file_name=sample-flexpod-test.yaml
@@ -1487,7 +1548,7 @@ then
                az network private-dns link vnet create -g $rg --zone-name "$private_zone_name" -n MyDNSLink --virtual-network $this_vnet_name --registration-enabled false  >/dev/null
                # Before creating the recordset verify if it was automatically created by private link?
                found_record_set=$(az network private-dns record-set a show -n $db_server_name --zone-name $private_zone_name -g $rg -o tsv --query name 2>/dev/null)
-               if [[ "$found_record_set" == "$db_server_name" ]]
+               if [[ -n ${found_record_set} ]] && [[ ${found_record_set} == ${db_server_name} ]]
                then
                     echo "Recordset $db_server_name already exists in DNS zone $private_zone_name, no need to create it"
                else
@@ -1610,18 +1671,18 @@ do
                     if [[ "$create_azfw" == "yes" ]]
                     then
                          ingress_ip=$(az network public-ip show -g $rg -n $this_azfw_pipname --query ipAddress -o tsv 2>/dev/null)
-                         echo "Region $this_location seems to be configured with an Azure Firewall in front of ngnix, with public IP $ingress_ip"
+                         echo "Region $this_location configured with an Azure Firewall in front of ngnix, with public IP $ingress_ip"
                     else
-                         nginx_ingress_svc_name=ingress-nginx-ingress-controller
-                         ingress_ip=$(kubectl get svc/$nginx_ingress_svc_name -o json | jq -rc '.status.loadBalancer.ingress[0].ip' 2>/dev/null)
-                         echo "Region $this_location seems to be configured with an nginx ingress controller, with IP $ingress_ip"
+                         nginx_ingress_svc_name=$(kubectl get svc -n $nginx_ingress_ns_name -o json | jq -r '.items[] | select(.spec.type == "LoadBalancer") | .metadata.name')
+                         ingress_ip=$(kubectl get svc/$nginx_ingress_svc_name -n $nginx_ingress_ns_name -o json | jq -rc '.status.loadBalancer.ingress[0].ip' 2>/dev/null)
+                         echo "Region $this_location configured with an nginx ingress controller, with IP $ingress_ip"
                     fi
                fi
                if [[ "$create_appgw" == "yes" ]]
                then
                     ingress_class=azure/application-gateway
                     ingress_ip=$(az network public-ip show -g $rg -n $this_appgw_pipname --query ipAddress -o tsv)
-                    echo "Region $this_location seems to be configured with an app gateway ingress controller, with IP $ingress_ip"
+                    echo "Region $this_location configured with an app gateway ingress controller, with IP $ingress_ip"
                fi
           else
                ingress_class=addon-http-application-routing
@@ -1848,16 +1909,31 @@ else
      echo "log-analytics Azure CLI extension found"
 fi
 ws_customerid=$(az monitor log-analytics workspace show -n $monitor_ws -g $monitor_rg --query customerId -o tsv 2>/dev/null)
-query='AzureDiagnostics 
+query_apprule='AzureDiagnostics 
 | where ResourceType == "AZUREFIREWALLS" 
 | where Category == "AzureFirewallApplicationRule" 
-| where TimeGenerated >= ago(4m) 
+| where TimeGenerated >= ago(5m) 
 | project Protocol=split(msg_s, " ")[0], From=split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",3,4)], To=split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",5,6)], Action=trim_end(".", tostring(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",7,8)])), Rule_Collection=iif(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",10,11)]=="traffic.", "AzureInternalTraffic", iif(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",10,11)]=="matched.","NoRuleMatched",trim_end(".",tostring(split(msg_s, " ")[iif(split(msg_s, " ")[0]=="HTTPS",10,11)])))), Rule=iif(split(msg_s, " ")[11]=="Proceeding" or split(msg_s, " ")[12]=="Proceeding","DefaultAction",split(msg_s, " ")[12]), msg_s 
 | where Rule_Collection != "AzureInternalTraffic" 
 | where Action == "Deny" 
 | take 100'
-az monitor log-analytics query -w $ws_customerid --analytics-query $query -o tsv
+query_netrule='AzureDiagnostics
+| where ResourceType == "AZUREFIREWALLS"
+| where Category == "AzureFirewallNetworkRule" and OperationName == "AzureFirewallNetworkRuleLog"
+| where TimeGenerated >= ago(5m)
+| project Protocol=split(msg_s, " ")[0], From=split(msg_s, " ")[3], To=trim_end(".", tostring(split(msg_s, " ")[5])), Action=split(msg_s, " ")[7]
+| extend From_IP=split(From, ":")[0], From_Port=split(From, ":")[1], To_IP=split(To, ":")[0], To_Port=split(To, ":")[1]
+| where Action == "Deny" 
+| take 100'
 
+az monitor log-analytics query -w $ws_customerid --analytics-query $query_apprule -o tsv
+echo "Run this command to query firewall dropped traffic for the last 5 minutes:"
+if [[ $script_sourced == "yes" ]]
+then
+     echo " az monitor log-analytics query -w \$ws_customerid --analytics-query \$query_apprule -o tsv"
+else
+     echo " az monitor log-analytics query -w $ws_customerid --analytics-query $query_apprule -o tsv"
+fi
 
 # Calculate script run time
 script_run_time=$(expr `date +%s` - $script_start_time)
