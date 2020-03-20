@@ -11,7 +11,10 @@ spec:
     ports:
     - containerPort: 80
       protocol: TCP
-
+    resources:
+      limits:
+        memory: "128Mi"
+        cpu: "250m"
 ---
 
 apiVersion: v1
