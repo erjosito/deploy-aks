@@ -59,7 +59,7 @@ metadata:
   name: kuard-ingress
   annotations:
     kubernetes.io/ingress.class: <ingress_class>
-    uppgw.ingress.kubernetes.io/use-private-ip: <private_ip>
+    appgw.ingress.kubernetes.io/use-private-ip: <private_ip>
 spec:
   rules:
   - host: <host_fqdn>
